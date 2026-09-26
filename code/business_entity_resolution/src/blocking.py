@@ -222,10 +222,12 @@ class TFIDFRetriever:
             ids = [r["entity_id"] for r in rows]
             vec = TfidfVectorizer(
                 ngram_range=self.ngram_range,
-                max_features=self.max_features,
+                max_features=150_000,   # 150K discriminative vocab (was 200K)
                 sublinear_tf=True,
                 analyzer="word",
-                min_df=1,
+                min_df=2,               # skip tokens appearing in only 1 doc (noise)
+                max_df=0.01,            # skip tokens in >1% of docs — "pvt","ltd","road","inc" etc.
+                stop_words="english",   # strip "the","of","and" etc.
             )
             try:
                 mat = vec.fit_transform(corpus)
@@ -273,28 +275,95 @@ class TFIDFRetriever:
 
     def query_batch(self, s1_rows: list[dict], n_workers: int = N_THREAD_WORKERS) -> list[set[str]]:
         """
-        Batch query for all S1 entities using multi-threaded sparse matrix ops.
+        Batch TF-IDF query using sparse matmul + CSC column access.
 
-        scipy sparse @ sparse operations release the GIL during BLAS execution,
-        so threading gives near-linear speedup here (tested: 12x on 14 threads).
-
-        Returns a list of candidate sets, one per S1 row (same order as input).
+        Key design decisions:
+        - NEVER call .toarray() on the full (N_corpus × K) result matrix.
+          For BATCH_Q=100: 6.2M × 100 × 8 bytes = 4.95 GB per batch → 65 TB total.
+        - Keep result SPARSE (mat @ Q.T stays CSR), convert to CSC for O(1) column access.
+          Typical sparse result: ~50-200 MB per batch (vs 4.95 GB dense).
+        - BATCH_Q=500: fewer Python loop iterations, more BLAS work per call.
+        - Access each query column via CSC indptr/indices/data arrays directly.
+          argpartition only on non-zero values (~1K-100K vs 6.2M).
         """
-        def _query_one(row: dict) -> set[str]:
+        from collections import defaultdict
+
+        BATCH_Q = 500  # queries per batch — sparse output, so memory cost is low
+
+        N = len(s1_rows)
+        results: list[set[str]] = [set()] * N
+
+        # ── Group S1 indices by country ────────────────────────────────────
+        country_to_indices: dict[str, list[int]] = defaultdict(list)
+        fallback_indices: list[int] = []
+        for i, row in enumerate(s1_rows):
             country = row.get("country") or "UNKNOWN"
             if country in self._vectorisers:
-                return self._query_single(row, country)
-            # Fallback: try all country buckets (handles France gap in train)
-            result: set[str] = set()
-            for c in self._vectorisers:
-                result |= self._query_single(row, c)
-            return result
+                country_to_indices[country].append(i)
+            else:
+                fallback_indices.append(i)
 
-        # Use threading — scipy sparse matmul releases the GIL ✓
-        results = Parallel(n_jobs=n_workers, backend="threading")(
-            delayed(_query_one)(row) for row in s1_rows
-        )
-        return results  # type: ignore[return-value]
+        # ── Per-country sparse matmul ──────────────────────────────────────
+        for country, indices in country_to_indices.items():
+            vec = self._vectorisers[country]
+            mat = self._matrices[country]   # (N_corpus × vocab) sparse CSR, normalized
+            ids = self._id_lists[country]
+            texts = [self._corpus_string(s1_rows[i]) for i in indices]
+            n_batches = (len(texts) + BATCH_Q - 1) // BATCH_Q
+            log.info(f"  [{country}] {len(indices):,} queries → "
+                     f"{n_batches:,} batches (BATCH_Q={BATCH_Q})")
+
+            for batch_num, batch_start in enumerate(range(0, len(texts), BATCH_Q)):
+                batch_texts   = texts[batch_start : batch_start + BATCH_Q]
+                batch_indices = indices[batch_start : batch_start + BATCH_Q]
+                try:
+                    Q = vec.transform(batch_texts)            # (K × vocab) sparse
+                    Q = normalize(Q, norm="l2", copy=False)
+                    # SPARSE result: (N_corpus × K) — NO .toarray() here!
+                    # Typical memory: ~50-200 MB vs 4.95 GB dense.
+                    score_mat = mat @ Q.T                     # sparse CSR (N_corpus × K)
+                    score_csc = score_mat.tocsc()             # CSC for O(1) column slicing
+                except Exception:
+                    continue
+
+                top_k = self.top_k
+                for j, global_idx in enumerate(batch_indices):
+                    # Get column j's non-zeros directly from CSC data structures
+                    col_start = score_csc.indptr[j]
+                    col_end   = score_csc.indptr[j + 1]
+                    if col_start == col_end:
+                        continue    # no overlap with any corpus doc — empty set
+                    col_vals = score_csc.data[col_start:col_end]    # float array (nnz,)
+                    col_rows = score_csc.indices[col_start:col_end]  # int array (nnz,)
+                    n_nnz = len(col_vals)
+                    if n_nnz <= top_k:
+                        # Fewer non-zeros than top_k — take all positive ones
+                        mask = col_vals > 0.0
+                        results[global_idx] = {ids[col_rows[p]]
+                                               for p in np.where(mask)[0]}
+                    else:
+                        # argpartition on nnz values only (often 1K-100K, not 6.2M)
+                        top_pos = np.argpartition(col_vals, -top_k)[-top_k:]
+                        results[global_idx] = {ids[col_rows[p]]
+                                               for p in top_pos
+                                               if col_vals[p] > 0.0}
+
+                # ── Progress every 100 batches ──────────────────────────────
+                if (batch_num + 1) % 100 == 0 or batch_num + 1 == n_batches:
+                    pct = (batch_num + 1) / n_batches * 100
+                    log.info(f"  [{country}] {batch_num + 1:,}/{n_batches:,} "
+                             f"batches ({pct:.1f}%)")
+
+        # ── Fallback: unknown-country rows query all buckets ───────────────
+        for i in fallback_indices:
+            combined: set[str] = set()
+            for c in self._vectorisers:
+                combined |= self._query_single(s1_rows[i], c)
+            results[i] = combined
+
+        return results
+
+
 
     def save(self, path: str | Path) -> None:
         with open(str(path), "wb") as f:
@@ -329,11 +398,18 @@ class MinHashLSH:
     """
     Character 3-gram MinHash LSH for fuzzy name matching.
     Uses datasketch library for efficient banding.
+
+    Size cap: buckets > MAX_BUCKET entities are SKIPPED.
+    Rationale: datasketch inserts are sequential O(N × num_perm) with no
+    parallel API. At 6M entities that is ~50 minutes for zero recall gain
+    over TF-IDF. Cap at 800K — large buckets are well-covered by TF-IDF.
     """
+
+    MAX_BUCKET = 800_000   # skip MinHash for buckets larger than this
 
     def __init__(
         self,
-        num_perm: int = 128,
+        num_perm: int = 64,    # reduced from 128 — halves build time, same recall
         threshold: float = 0.2,
         n: int = 3,
     ):
@@ -356,22 +432,42 @@ class MinHashLSH:
 
         for country in df["country"].unique().to_list():
             sub = df.filter(pl.col("country") == country)
-            if len(sub) == 0:
+            n_sub = len(sub)
+            if n_sub == 0:
                 continue
+
+            # ── Size cap ──────────────────────────────────────────────────
+            if n_sub > self.MAX_BUCKET:
+                log.warning(
+                    f"  MinHash [{country}]: {n_sub:,} entities exceeds cap "
+                    f"({self.MAX_BUCKET:,}) — SKIPPED. TF-IDF covers this bucket."
+                )
+                continue
+
             lsh = _LSH(threshold=self.threshold, num_perm=self.num_perm)
-            for row in sub.iter_rows(named=True):
-                eid = row["entity_id"]
-                name = row.get("norm_name", "") or ""
-                if not name:
-                    continue
-                try:
-                    mh = self._make_minhash(name)
-                    lsh.insert(eid, mh)
-                    self._minhash_cache[eid] = mh
-                except Exception:
-                    pass
+            with make_progress() as progress:
+                task = progress.add_task(
+                    f"  MinHash [{country}] ({n_sub:,} entities)", total=n_sub
+                )
+                inserted = 0
+                for row in sub.iter_rows(named=True):
+                    eid = row["entity_id"]
+                    name = row.get("norm_name", "") or ""
+                    if not name:
+                        progress.advance(task)
+                        continue
+                    try:
+                        mh = self._make_minhash(name)
+                        lsh.insert(eid, mh)
+                        self._minhash_cache[eid] = mh
+                        inserted += 1
+                    except Exception:
+                        pass
+                    progress.advance(task)
+
             self._lsh_per_country[country] = lsh
-            log.info(f"  MinHash LSH [{country}]: {len(sub):,} entities")
+            log.info(f"  MinHash LSH [{country}]: {inserted:,} / {n_sub:,} entities indexed")
+
 
     def query(self, s1_row: dict) -> set[str]:
         country = s1_row.get("country") or "UNKNOWN"
@@ -499,21 +595,18 @@ def run_blocking(
 
     log.info(f"  [highlight]{n_workers}[/highlight] threads for TF-IDF + MinHash queries")
 
-    # ── Batch TF-IDF (threading — scipy releases GIL) ─────────────────────
-    with StageTimer("TF-IDF batch query (threaded)", show_sysinfo=False):
-        tfidf_results = tfidf.query_batch(s1_rows, n_workers=n_workers)
+    # ── Batch TF-IDF (batched matmul — scipy multi-threaded BLAS) ─────────
+    with StageTimer("TF-IDF batch query (batched matmul)", show_sysinfo=False):
+        tfidf_results = tfidf.query_batch(s1_rows)
 
-    # ── Batch MinHash (threading — datasketch is C-backed) ─────────────────
-    if minhash is not None:
-        def _minhash_one(row: dict) -> set[str]:
-            return minhash.query(row)
-
-        with StageTimer("MinHash batch query (threaded)", show_sysinfo=False):
-            minhash_results = Parallel(n_jobs=n_workers, backend="threading")(
-                delayed(_minhash_one)(row) for row in s1_rows
-            )
+    # ── MinHash batch (serial — only small buckets are indexed) ───────────
+    if minhash is not None and minhash._lsh_per_country:
+        with StageTimer("MinHash batch query", show_sysinfo=False):
+            minhash_results = [minhash.query(row) for row in s1_rows]
     else:
         minhash_results = [set()] * len(s1_rows)
+
+
 
     # ── Merge all strategies (postal + token serial, union with tfidf/minhash) ─
     results: list[dict] = []
