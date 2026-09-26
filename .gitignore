@@ -1,7 +1,11 @@
 # Datasets (large files >3GB)
 dataset/
 
-# Pipeline outputs - tracked by default, specific large files excluded below
+# Pipeline outputs and large artifacts (>100MB hosted on Hugging Face)
+output/*
+!output/.gitkeep
+!output/models/
+!output/models/**
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

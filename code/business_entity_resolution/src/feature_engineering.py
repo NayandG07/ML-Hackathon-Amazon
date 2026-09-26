@@ -69,7 +69,7 @@ log = get_logger("feature_engineering")
 # Re-export FEATURE_COLS so callers that do
 #   from feature_engineering import FEATURE_COLS
 # continue to work after the canonical definition moved to fast_features.py
-from fast_features import FEATURE_COLS  # noqa: F401  (intentional re-export)
+from fast_features import FEATURE_COLS, build_flat_pairs, vectorized_featurise  # noqa: F401
 
 
 
@@ -480,9 +480,9 @@ def main():
 
         if args.use_fast:
             # ── Fast path: Polars join + vectorized numpy/rapidfuzz ──────
-            from fast_features import build_flat_pairs, vectorized_featurise
-            flat_df = build_flat_pairs(candidates_df, s1_df, s23_df)
-            features_df = vectorized_featurise(flat_df, ground_truth=gt, chunk_size=500_000)
+            flat_df = build_flat_pairs(candidates_df, s1_df, s23_df, ground_truth=gt)
+            features_df = vectorized_featurise(flat_df, ground_truth=gt, chunk_size=200_000)
+
         else:
             # ── Fallback: row-by-row Python loop (slower but simpler) ────
             log.info("Building entity lookup dicts …")

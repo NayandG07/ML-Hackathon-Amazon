@@ -223,9 +223,10 @@ def StageTimer(name: str, show_sysinfo: bool = True) -> Iterator[None]:
         console.print()
         console.print(
             Panel(
-                f"[success]✓  {name}[/success]\n"
+                f"[success]OK  {name}[/success]\n"
                 f"[dim_white]Elapsed: [/dim_white][metric]{td}[/metric]"
                 f"[dim_white]  ({elapsed:.1f}s)[/dim_white]",
+
                 box=box.ROUNDED,
                 border_style="green",
                 padding=(0, 2),

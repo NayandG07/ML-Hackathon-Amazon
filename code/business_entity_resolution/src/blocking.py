@@ -140,10 +140,12 @@ def postal_candidates(
 # Strategy 2: Inverted token index
 # ---------------------------------------------------------------------------
 
-def build_token_index(df: pl.DataFrame) -> dict[str, dict[str, list[str]]]:
+def build_token_index(df: pl.DataFrame, max_bucket_size: int = 1000) -> dict[str, dict[str, list[str]]]:
     """
     Returns nested dict {country: {token: [entity_id, ...]}}
     Indexed on name_tokens column.
+    Buckets larger than max_bucket_size (generic noise words like 'pvt', 'ltd', 'inc')
+    are pruned to ensure lightning-fast candidate retrieval.
     """
     idx: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for row in df.iter_rows(named=True):
@@ -151,7 +153,11 @@ def build_token_index(df: pl.DataFrame) -> dict[str, dict[str, list[str]]]:
         tokens = _tokens(row.get("name_tokens", ""))
         for tok in tokens:
             idx[country][tok].append(row["entity_id"])
-    return {k: dict(v) for k, v in idx.items()}
+    return {
+        c: {tok: eids for tok, eids in c_idx.items() if len(eids) <= max_bucket_size}
+        for c, c_idx in idx.items()
+    }
+
 
 
 def token_candidates(
@@ -275,20 +281,13 @@ class TFIDFRetriever:
 
     def query_batch(self, s1_rows: list[dict], n_workers: int = N_THREAD_WORKERS) -> list[set[str]]:
         """
-        Batch TF-IDF query using sparse matmul + CSC column access.
-
-        Key design decisions:
-        - NEVER call .toarray() on the full (N_corpus × K) result matrix.
-          For BATCH_Q=100: 6.2M × 100 × 8 bytes = 4.95 GB per batch → 65 TB total.
-        - Keep result SPARSE (mat @ Q.T stays CSR), convert to CSC for O(1) column access.
-          Typical sparse result: ~50-200 MB per batch (vs 4.95 GB dense).
-        - BATCH_Q=500: fewer Python loop iterations, more BLAS work per call.
-        - Access each query column via CSC indptr/indices/data arrays directly.
-          argpartition only on non-zero values (~1K-100K vs 6.2M).
+        Multi-threaded batch TF-IDF query: Q @ mat_T across all CPU cores.
         """
         from collections import defaultdict
+        from joblib import Parallel, delayed
 
-        BATCH_Q = 500  # queries per batch — sparse output, so memory cost is low
+        BATCH_Q = 500  # queries per batch
+        n_workers = safe_n_workers(n_workers)
 
         N = len(s1_rows)
         results: list[set[str]] = [set()] * N
@@ -303,56 +302,63 @@ class TFIDFRetriever:
             else:
                 fallback_indices.append(i)
 
-        # ── Per-country sparse matmul ──────────────────────────────────────
+        # ── Per-country parallel sparse matmul: Q @ mat_T ──────────────────
         for country, indices in country_to_indices.items():
             vec = self._vectorisers[country]
-            mat = self._matrices[country]   # (N_corpus × vocab) sparse CSR, normalized
+            mat = self._matrices[country]
             ids = self._id_lists[country]
+            log.info(f"  [{country}] Preparing transposed corpus matrix …")
+            mat_T = mat.T.tocsr()           # Transpose once!
+
             texts = [self._corpus_string(s1_rows[i]) for i in indices]
             n_batches = (len(texts) + BATCH_Q - 1) // BATCH_Q
-            log.info(f"  [{country}] {len(indices):,} queries → "
-                     f"{n_batches:,} batches (BATCH_Q={BATCH_Q})")
+            log.info(f"  [{country}] {len(indices):,} queries → {n_batches:,} batches "
+                     f"(BATCH_Q={BATCH_Q}, {n_workers} threads)")
 
-            for batch_num, batch_start in enumerate(range(0, len(texts), BATCH_Q)):
-                batch_texts   = texts[batch_start : batch_start + BATCH_Q]
-                batch_indices = indices[batch_start : batch_start + BATCH_Q]
+            top_k = self.top_k
+
+            def _process_one_batch(b_idx: int) -> tuple[list[int], list[set[str]]]:
+                b_start = b_idx * BATCH_Q
+                b_texts = texts[b_start : b_start + BATCH_Q]
+                b_indices = indices[b_start : b_start + len(b_texts)]
                 try:
-                    Q = vec.transform(batch_texts)            # (K × vocab) sparse
+                    Q = vec.transform(b_texts)
                     Q = normalize(Q, norm="l2", copy=False)
-                    # SPARSE result: (N_corpus × K) — NO .toarray() here!
-                    # Typical memory: ~50-200 MB vs 4.95 GB dense.
-                    score_mat = mat @ Q.T                     # sparse CSR (N_corpus × K)
-                    score_csc = score_mat.tocsc()             # CSC for O(1) column slicing
+                    score_mat = Q @ mat_T
                 except Exception:
-                    continue
+                    return b_indices, [set()] * len(b_indices)
 
-                top_k = self.top_k
-                for j, global_idx in enumerate(batch_indices):
-                    # Get column j's non-zeros directly from CSC data structures
-                    col_start = score_csc.indptr[j]
-                    col_end   = score_csc.indptr[j + 1]
-                    if col_start == col_end:
-                        continue    # no overlap with any corpus doc — empty set
-                    col_vals = score_csc.data[col_start:col_end]    # float array (nnz,)
-                    col_rows = score_csc.indices[col_start:col_end]  # int array (nnz,)
-                    n_nnz = len(col_vals)
+                batch_res = []
+                for j in range(len(b_indices)):
+                    start = score_mat.indptr[j]
+                    end   = score_mat.indptr[j + 1]
+                    if start == end:
+                        batch_res.append(set())
+                        continue
+                    vals = score_mat.data[start:end]
+                    cols = score_mat.indices[start:end]
+                    n_nnz = len(vals)
                     if n_nnz <= top_k:
-                        # Fewer non-zeros than top_k — take all positive ones
-                        mask = col_vals > 0.0
-                        results[global_idx] = {ids[col_rows[p]]
-                                               for p in np.where(mask)[0]}
+                        batch_res.append({ids[cols[p]] for p in range(n_nnz) if vals[p] > 0.0})
                     else:
-                        # argpartition on nnz values only (often 1K-100K, not 6.2M)
-                        top_pos = np.argpartition(col_vals, -top_k)[-top_k:]
-                        results[global_idx] = {ids[col_rows[p]]
-                                               for p in top_pos
-                                               if col_vals[p] > 0.0}
+                        top_pos = np.argpartition(vals, -top_k)[-top_k:]
+                        batch_res.append({ids[cols[p]] for p in top_pos if vals[p] > 0.0})
+                return b_indices, batch_res
 
-                # ── Progress every 100 batches ──────────────────────────────
-                if (batch_num + 1) % 100 == 0 or batch_num + 1 == n_batches:
-                    pct = (batch_num + 1) / n_batches * 100
-                    log.info(f"  [{country}] {batch_num + 1:,}/{n_batches:,} "
-                             f"batches ({pct:.1f}%)")
+            # Run in parallel with progress bar
+            with make_progress() as progress:
+                task = progress.add_task(f"  TF-IDF [{country}]", total=n_batches)
+                # Process in chunks of 50 batches for reactive progress reporting
+                chunk_step = 25
+                for c_start in range(0, n_batches, chunk_step):
+                    c_end = min(c_start + chunk_step, n_batches)
+                    chunk_outputs = Parallel(n_jobs=n_workers, backend="threading")(
+                        delayed(_process_one_batch)(b_idx) for b_idx in range(c_start, c_end)
+                    )
+                    for b_indices, b_res in chunk_outputs:
+                        for global_idx, res_set in zip(b_indices, b_res):
+                            results[global_idx] = res_set
+                    progress.advance(task, advance=(c_end - c_start))
 
         # ── Fallback: unknown-country rows query all buckets ───────────────
         for i in fallback_indices:
@@ -362,6 +368,8 @@ class TFIDFRetriever:
             results[i] = combined
 
         return results
+
+
 
 
 
@@ -566,16 +574,22 @@ def run_blocking(
 
     # --- Strategy 2: token index ---
     with StageTimer("Strategy 2 — Inverted Token Index", show_sysinfo=False):
-        token_idx = build_token_index(s23_df)
+        token_idx = build_token_index(s23_df, max_bucket_size=1000)
         total_buckets = sum(len(v) for v in token_idx.values())
-        log.info(f"  [highlight]{total_buckets:,}[/highlight] total token buckets")
+        log.info(f"  [highlight]{total_buckets:,}[/highlight] total token buckets (pruned buckets > 1,000)")
 
     # --- Strategy 3: TF-IDF ---
+    tfidf_file = (artifacts_dir / "tfidf.pkl") if artifacts_dir else None
     with StageTimer("Strategy 3 — TF-IDF Retriever", show_sysinfo=False):
-        tfidf = TFIDFRetriever(top_k=top_k_tfidf)
-        tfidf.fit(s23_df)
-        if artifacts_dir:
-            tfidf.save(artifacts_dir / "tfidf.pkl")
+
+        if tfidf_file and tfidf_file.exists():
+            log.info(f"  [success]Found cached TF-IDF model[/success] at {tfidf_file} — loading …")
+            tfidf = TFIDFRetriever.load(tfidf_file)
+        else:
+            tfidf = TFIDFRetriever(top_k=top_k_tfidf)
+            tfidf.fit(s23_df)
+            if tfidf_file:
+                tfidf.save(tfidf_file)
 
     # --- Strategy 4: MinHash LSH ---
     minhash: Optional[MinHashLSH] = None
@@ -596,8 +610,18 @@ def run_blocking(
     log.info(f"  [highlight]{n_workers}[/highlight] threads for TF-IDF + MinHash queries")
 
     # ── Batch TF-IDF (batched matmul — scipy multi-threaded BLAS) ─────────
-    with StageTimer("TF-IDF batch query (batched matmul)", show_sysinfo=False):
-        tfidf_results = tfidf.query_batch(s1_rows)
+    tfidf_cache = (artifacts_dir / "tfidf_results.pkl") if artifacts_dir else None
+    if tfidf_cache and tfidf_cache.exists():
+        log.info(f"  [success]Found cached TF-IDF results[/success] at {tfidf_cache} — loading …")
+        with open(tfidf_cache, "rb") as f:
+            tfidf_results = pickle.load(f)
+    else:
+        with StageTimer("TF-IDF batch query (fast matmul)", show_sysinfo=False):
+            tfidf_results = tfidf.query_batch(s1_rows)
+            if tfidf_cache:
+                with open(tfidf_cache, "wb") as f:
+                    pickle.dump(tfidf_results, f, protocol=4)
+                log.info(f"  Saved TF-IDF results checkpoint to {tfidf_cache}")
 
     # ── MinHash batch (serial — only small buckets are indexed) ───────────
     if minhash is not None and minhash._lsh_per_country:
@@ -605,6 +629,7 @@ def run_blocking(
             minhash_results = [minhash.query(row) for row in s1_rows]
     else:
         minhash_results = [set()] * len(s1_rows)
+
 
 
 

@@ -364,9 +364,7 @@ def vectorized_featurise(
 
     # ── Concatenate chunks into Polars DataFrame ───────────────────────────
     log.info("Assembling final DataFrame …")
-    dfs = [pl.DataFrame({k: v.tolist() if isinstance(v, np.ndarray) else v
-                         for k, v in c.items()})
-           for c in all_chunks]
+    dfs = [pl.DataFrame(c) for c in all_chunks]
     return pl.concat(dfs, rechunk=True)
 
 
@@ -382,24 +380,58 @@ def build_flat_pairs(
     candidates_df: pl.DataFrame,
     s1_df: pl.DataFrame,
     s23_df: pl.DataFrame,
+    ground_truth: Optional[dict[str, set[str]]] = None,
+    max_negatives: int = 2,
+    max_candidates_test: int = 30,
 ) -> pl.DataFrame:
     """
     Explode candidate_pairs → flat (s1_id, cand_id) + joined columns.
-    Done entirely in Polars (columnar, no Python loops).
+
+    For training (ground_truth provided):
+      Keeps ALL positive matches plus `max_negatives` hard negatives per entity.
+      Reduces 223M explosive pairs down to ~10M clean, balanced training pairs.
+    For inference/test:
+      Caps candidate pairs to top `max_candidates_test` per entity to fit safely in memory.
     """
     with StageTimer("Build flat pairs (Polars join)", show_sysinfo=False):
-        # Explode comma-separated candidates to one row per pair
-        flat = (
-            candidates_df
-            .filter(pl.col("candidate_entity_ids").is_not_null()
-                    & (pl.col("candidate_entity_ids") != ""))
-            .with_columns(
-                pl.col("candidate_entity_ids").str.split(",").alias("cand_list")
+        if ground_truth is not None:
+            log.info("  Sampling all true positive matches + hard negatives for training …")
+            s1_list: list[str] = []
+            cand_list: list[str] = []
+            for row in candidates_df.iter_rows(named=True):
+                s1_id = row["source1_entity_id"]
+                raw_c = row.get("candidate_entity_ids") or ""
+                if not raw_c:
+                    continue
+                c_all = raw_c.split(",")
+                true_m = ground_truth.get(s1_id, set())
+                n_neg = 0
+                for c in c_all:
+                    if c in true_m:
+                        s1_list.append(s1_id)
+                        cand_list.append(c)
+                    elif n_neg < max_negatives:
+                        s1_list.append(s1_id)
+                        cand_list.append(c)
+                        n_neg += 1
+            flat = pl.DataFrame({"s1_id": s1_list, "cand_id": cand_list})
+        else:
+            log.info(f"  Inference mode: capping to top-{max_candidates_test} candidates per entity …")
+            flat = (
+                candidates_df
+                .filter(pl.col("candidate_entity_ids").is_not_null()
+                        & (pl.col("candidate_entity_ids") != ""))
+                .with_columns(
+                    pl.col("candidate_entity_ids")
+                    .str.split(",")
+                    .list.slice(0, max_candidates_test)
+                    .alias("cand_list")
+                )
+                .explode("cand_list")
+                .rename({"source1_entity_id": "s1_id", "cand_list": "cand_id"})
+                .filter(pl.col("cand_id") != "")
             )
-            .explode("cand_list")
-            .rename({"source1_entity_id": "s1_id", "cand_list": "cand_id"})
-            .filter(pl.col("cand_id") != "")
-        )
+
         log.info(f"  Exploded to [highlight]{len(flat):,}[/highlight] pairs")
 
         # Join S1 columns
@@ -421,3 +453,4 @@ def build_flat_pairs(
         log.info(f"  After join filter: [highlight]{len(flat):,}[/highlight] valid pairs")
 
     return flat
+
