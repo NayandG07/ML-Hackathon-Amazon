@@ -193,12 +193,32 @@ def encode_split(
             _embed_text(n, a) for n, a in zip(norm_names, norm_addrs)
         ]
 
-        log.info(f"  Encoding {len(texts):,} {split}_{label} records …")
-        embeddings = encoder.encode(texts)
+        log.info(f"  Encoding {len(texts):,} {split}_{label} records directly to disk (chunked open_memmap) …")
+        n_texts = len(texts)
+        CHUNK = 500_000
 
-        np.save(str(embed_path), embeddings)
+        # Preallocate .npy directly on disk with valid .npy header
+        embed_mmap = np.lib.format.open_memmap(
+            str(embed_path),
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_texts, EMBED_DIM),
+        )
+
+        for c_start in range(0, n_texts, CHUNK):
+            c_end = min(c_start + CHUNK, n_texts)
+            log.info(f"    Chunk [{c_start:,} : {c_end:,}] ({c_end/n_texts*100:.1f}%) …")
+            chunk_texts = texts[c_start:c_end]
+            chunk_emb = encoder.encode(chunk_texts)
+            embed_mmap[c_start:c_end] = chunk_emb
+            embed_mmap.flush()
+            del chunk_emb
+            import gc
+            gc.collect()
+
+        del embed_mmap
         np.save(str(id_path), np.array(entity_ids, dtype=object))
-        log.info(f"  Saved {embed_path.name} ({embeddings.shape})")
+        log.info(f"  Saved {embed_path.name} ({n_texts:,}, {EMBED_DIM})")
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +235,10 @@ def score_candidates(
     For each candidate pair, compute cosine similarity using pre-computed embeddings.
     Output is a Parquet file with columns [s1_id, cand_id, embed_cosine_sim].
     """
-    log.info("Loading stored embeddings …")
-    s1_embeds = np.load(str(embeddings_dir / f"{split}_s1_embeds.npy"))
+    log.info("Loading stored embeddings (mmap) …")
+    s1_embeds = np.load(str(embeddings_dir / f"{split}_s1_embeds.npy"), mmap_mode="r")
     s1_ids = np.load(str(embeddings_dir / f"{split}_s1_ids.npy"), allow_pickle=True)
-    s23_embeds = np.load(str(embeddings_dir / f"{split}_s23_embeds.npy"))
+    s23_embeds = np.load(str(embeddings_dir / f"{split}_s23_embeds.npy"), mmap_mode="r")
     s23_ids = np.load(str(embeddings_dir / f"{split}_s23_ids.npy"), allow_pickle=True)
 
     # Build O(1) lookup: entity_id → index
