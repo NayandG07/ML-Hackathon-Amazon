@@ -239,9 +239,10 @@ def negative_downsample(
 
 def _gpu_available() -> bool:
     try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
+        clf = lgb.LGBMClassifier(n_estimators=1, device="cuda", verbose=-1)
+        clf.fit(np.zeros((2, 2)), np.array([0, 1]))
+        return True
+    except Exception:
         return False
 
 
@@ -249,7 +250,7 @@ def _build_lgbm_params() -> dict:
     params = {
         "objective": "binary",
         "metric": "binary_logloss",
-        "boosting_type": "dart",
+        "boosting_type": "gbdt",
         "learning_rate": 0.05,
         "num_leaves": 255,
         "max_depth": 8,
@@ -266,11 +267,12 @@ def _build_lgbm_params() -> dict:
     }
     if _gpu_available():
         params["device"] = "cuda"
-        params["gpu_use_dp"] = False   # FP32 is faster for 6GB VRAM
+        params["gpu_use_dp"] = False
         log.info("  GPU detected — LightGBM will use CUDA device.")
     else:
-        log.info("  No GPU detected — LightGBM running on CPU.")
+        log.info("  LightGBM running on multi-threaded CPU (all 16 cores).")
     return params
+
 
 
 LGBM_PARAMS = _build_lgbm_params()

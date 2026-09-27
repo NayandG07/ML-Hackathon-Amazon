@@ -165,30 +165,155 @@ def _paired_scores(queries: list[str], choices: list[str], scorer) -> np.ndarray
 
 
 # ---------------------------------------------------------------------------
-# Main vectorized featuriser
+# Chunk featuriser (shared by train & inference)
 # ---------------------------------------------------------------------------
+
+def compute_chunk_dict(chunk: pl.DataFrame) -> dict:
+    n = len(chunk)
+    # Extract columns to Python lists once
+    nn_s1   = chunk["norm_name_s1"].fill_null("").to_list()
+    nn_cand = chunk["norm_name_cand"].fill_null("").to_list()
+    na_s1   = chunk["norm_address_s1"].fill_null("").to_list()
+    na_cand = chunk["norm_address_cand"].fill_null("").to_list()
+    nt_s1   = chunk["name_tokens_s1"].fill_null("").to_list()
+    nt_cand = chunk["name_tokens_cand"].fill_null("").to_list()
+    at_s1   = chunk["address_tokens_s1"].fill_null("").to_list()
+    at_cand = chunk["address_tokens_cand"].fill_null("").to_list()
+    pc_s1   = chunk["postal_code_s1"].to_list()
+    pc_cand = chunk["postal_code_cand"].to_list()
+    hn_s1   = chunk["house_number_s1"].to_list()
+    hn_cand = chunk["house_number_cand"].to_list()
+    co_s1   = chunk["country_s1"].fill_null("").to_list()
+    co_cand = chunk["country_cand"].fill_null("").to_list()
+    cand_id_list = chunk["cand_id"].to_list()
+
+    # ── A. Name features (rapidfuzz C++ list comprehension) ───────
+    name_ratio          = _paired_scores(nn_s1, nn_cand, fuzz.ratio)
+    name_partial_ratio  = _paired_scores(nn_s1, nn_cand, fuzz.partial_ratio)
+    name_token_sort     = _paired_scores(nn_s1, nn_cand, fuzz.token_sort_ratio)
+    name_token_set      = _paired_scores(nn_s1, nn_cand, fuzz.token_set_ratio)
+    name_jw             = _paired_scores(nn_s1, nn_cand, fuzz.WRatio)
+
+    name_jaccard        = _vec_jaccard_tokens(nt_s1, nt_cand)
+    name_token_overlap  = _vec_token_overlap(nt_s1, nt_cand)
+    name_len_s1  = np.array([len(s) for s in nn_s1], dtype=np.float32)
+    name_len_c   = np.array([len(s) for s in nn_cand], dtype=np.float32)
+    name_len_mx  = np.maximum(name_len_s1, name_len_c)
+    name_len_ratio       = np.where(name_len_mx == 0, 0.0, name_len_s1 / name_len_mx).astype(np.float32)
+    name_len_diff        = np.abs(name_len_s1 - name_len_c) / np.maximum(name_len_mx, 1)
+    ntc_s1 = _vec_token_count(nt_s1)
+    ntc_c  = _vec_token_count(nt_cand)
+    ntc_mx = np.maximum(ntc_s1, ntc_c)
+    name_token_count_ratio = np.where(ntc_mx == 0, 0.0, ntc_s1 / ntc_mx).astype(np.float32)
+    name_token_count_diff  = np.abs(ntc_s1 - ntc_c) / np.maximum(ntc_mx, 1)
+    name_prefix_match      = _vec_prefix_match(nn_s1, nn_cand)
+    name_bigram_jaccard    = _vec_ngram_jaccard(nn_s1, nn_cand, 2)
+    name_trigram_jaccard   = _vec_ngram_jaccard(nn_s1, nn_cand, 3)
+    name_first_token_match = _vec_first_token_match(nt_s1, nt_cand)
+
+    # ── B. Address features ──────────────────────────────────────
+    addr_ratio       = _paired_scores(na_s1, na_cand, fuzz.ratio)
+    addr_token_sort  = _paired_scores(na_s1, na_cand, fuzz.token_sort_ratio)
+    addr_token_set   = _paired_scores(na_s1, na_cand, fuzz.token_set_ratio)
+    addr_jaccard     = _vec_jaccard_tokens(at_s1, at_cand)
+    addr_token_overlap = _vec_token_overlap(at_s1, at_cand)
+    addr_numeric_jac = _vec_numeric_jaccard(na_s1, na_cand)
+
+    # ── C. Structural features ───────────────────────────────────
+    postal_match  = np.array([
+        float(bool(a) and bool(b) and a == b) for a, b in zip(pc_s1, pc_cand)
+    ], dtype=np.float32)
+    postal_both_empty = np.array([
+        float(not a and not b) for a, b in zip(pc_s1, pc_cand)
+    ], dtype=np.float32)
+    hn_match = np.array([
+        float(bool(a) and bool(b) and a == b) for a, b in zip(hn_s1, hn_cand)
+    ], dtype=np.float32)
+
+    s1_addr_empty   = np.array([float(not a) for a in na_s1], dtype=np.float32)
+    cand_addr_empty = np.array([float(not a) for a in na_cand], dtype=np.float32)
+    both_addr_empty = s1_addr_empty * cand_addr_empty
+    country_match   = np.array([float(a.upper() == b.upper() and bool(a))
+                                for a, b in zip(co_s1, co_cand)], dtype=np.float32)
+    cand_is_s3 = np.array([float(cid.startswith("S3-")) for cid in cand_id_list],
+                          dtype=np.float32)
+
+    # ── D. Cross / interaction features ─────────────────────────
+    all_len_s1 = name_len_s1 + np.array([len(a) for a in na_s1], dtype=np.float32)
+    all_len_c  = name_len_c  + np.array([len(a) for a in na_cand], dtype=np.float32)
+    all_mx = np.maximum(all_len_s1, all_len_c)
+    combined_len_ratio = np.where(all_mx == 0, 0.0, all_len_s1 / all_mx).astype(np.float32)
+
+    name_toks_in_addr = _vec_tokens_in_other(nt_s1, at_cand)
+    name_s1_longer  = (name_len_s1 > name_len_c).astype(np.float32)
+    name_cand_longer = (name_len_c > name_len_s1).astype(np.float32)
+
+    # Harmonic mean of name and addr ratio
+    nr, ar = name_ratio, addr_ratio
+    denom = nr + ar
+    name_addr_harmonic = np.where(denom == 0, 0.0, 2 * nr * ar / denom).astype(np.float32)
+
+    name_jaccard_x_addr = name_jaccard * addr_jaccard
+    name_max_sim = np.maximum(name_ratio, np.maximum(name_token_sort, name_token_set))
+    country_mismatch = 1.0 - country_match
+    both_short_name = ((name_len_s1 < 6) & (name_len_c < 6)).astype(np.float32)
+
+    return {
+        "s1_id":   chunk["s1_id"].to_list(),
+        "cand_id": cand_id_list,
+        # A. Name
+        "name_ratio":              name_ratio,
+        "name_partial_ratio":      name_partial_ratio,
+        "name_token_sort_ratio":   name_token_sort,
+        "name_token_set_ratio":    name_token_set,
+        "name_jaccard":            name_jaccard,
+        "name_token_overlap":      name_token_overlap,
+        "name_jaro_winkler":       name_jw,
+        "name_len_ratio":          name_len_ratio,
+        "name_len_diff":           name_len_diff.astype(np.float32),
+        "name_token_count_ratio":  name_token_count_ratio,
+        "name_prefix_match":       name_prefix_match,
+        "name_bigram_jaccard":     name_bigram_jaccard,
+        "name_trigram_jaccard":    name_trigram_jaccard,
+        "name_first_token_match":  name_first_token_match,
+        "name_token_count_diff":   name_token_count_diff.astype(np.float32),
+        # B. Address
+        "addr_ratio":              addr_ratio,
+        "addr_token_sort_ratio":   addr_token_sort,
+        "addr_token_set_ratio":    addr_token_set,
+        "addr_jaccard":            addr_jaccard,
+        "addr_token_overlap":      addr_token_overlap,
+        "addr_numeric_jaccard":    addr_numeric_jac,
+        # C. Structural
+        "postal_code_match":       postal_match,
+        "postal_both_empty":       postal_both_empty,
+        "house_num_match":         hn_match,
+        "s1_addr_empty":           s1_addr_empty,
+        "cand_addr_empty":         cand_addr_empty,
+        "both_addr_empty":         both_addr_empty,
+        "country_match":           country_match,
+        "cand_is_s3":              cand_is_s3,
+        # D. Cross
+        "combined_len_ratio":           combined_len_ratio,
+        "name_tokens_in_cand_addr":     name_toks_in_addr,
+        "name_s1_longer":               name_s1_longer,
+        "name_cand_longer":             name_cand_longer,
+        "name_addr_harmonic":           name_addr_harmonic,
+        "name_jaccard_x_addr_jaccard":  name_jaccard_x_addr,
+        "name_max_sim":                 name_max_sim,
+        "country_mismatch_penalty":     country_mismatch,
+        "both_short_name":              both_short_name,
+        "embed_cosine_sim":            np.zeros(n, dtype=np.float32),
+    }
+
 
 def vectorized_featurise(
     flat_df: pl.DataFrame,
     ground_truth: Optional[dict[str, set[str]]] = None,
-    chunk_size: int = 500_000,
+    chunk_size: int = 200_000,
 ) -> pl.DataFrame:
     """
-    Compute all 39 fuzzy + structural features in vectorized batches.
-
-    Parameters
-    ----------
-    flat_df      : Polars DataFrame with columns:
-                   s1_id, cand_id,
-                   norm_name_s1, norm_name_cand,
-                   norm_address_s1, norm_address_cand,
-                   name_tokens_s1, name_tokens_cand,
-                   address_tokens_s1, address_tokens_cand,
-                   postal_code_s1, postal_code_cand,
-                   house_number_s1, house_number_cand,
-                   country_s1, country_cand
-    ground_truth : optional labels dict
-    chunk_size   : rows per chunk for cdist (controls peak RAM)
+    Compute all 38 hand-crafted features using C-level rapidfuzz and numpy vectorization.
 
     Returns
     -------
@@ -218,146 +343,9 @@ def vectorized_featurise(
 
         for start in range(0, n_total, chunk_size):
             chunk = flat_df.slice(start, chunk_size)
-            n = len(chunk)
-
-            # Extract columns to Python lists once
-            nn_s1   = chunk["norm_name_s1"].fill_null("").to_list()
-            nn_cand = chunk["norm_name_cand"].fill_null("").to_list()
-            na_s1   = chunk["norm_address_s1"].fill_null("").to_list()
-            na_cand = chunk["norm_address_cand"].fill_null("").to_list()
-            nt_s1   = chunk["name_tokens_s1"].fill_null("").to_list()
-            nt_cand = chunk["name_tokens_cand"].fill_null("").to_list()
-            at_s1   = chunk["address_tokens_s1"].fill_null("").to_list()
-            at_cand = chunk["address_tokens_cand"].fill_null("").to_list()
-            pc_s1   = chunk["postal_code_s1"].to_list()
-            pc_cand = chunk["postal_code_cand"].to_list()
-            hn_s1   = chunk["house_number_s1"].to_list()
-            hn_cand = chunk["house_number_cand"].to_list()
-            co_s1   = chunk["country_s1"].fill_null("").to_list()
-            co_cand = chunk["country_cand"].fill_null("").to_list()
-            cand_id_list = chunk["cand_id"].to_list()
-
-            # ── A. Name features (rapidfuzz C++ list comprehension) ───────
-            name_ratio          = _paired_scores(nn_s1, nn_cand, fuzz.ratio)
-            name_partial_ratio  = _paired_scores(nn_s1, nn_cand, fuzz.partial_ratio)
-            name_token_sort     = _paired_scores(nn_s1, nn_cand, fuzz.token_sort_ratio)
-            name_token_set      = _paired_scores(nn_s1, nn_cand, fuzz.token_set_ratio)
-            name_jw             = _paired_scores(nn_s1, nn_cand, fuzz.WRatio)
-
-            name_jaccard        = _vec_jaccard_tokens(nt_s1, nt_cand)
-            name_token_overlap  = _vec_token_overlap(nt_s1, nt_cand)
-            name_len_s1  = np.array([len(s) for s in nn_s1], dtype=np.float32)
-            name_len_c   = np.array([len(s) for s in nn_cand], dtype=np.float32)
-            name_len_mx  = np.maximum(name_len_s1, name_len_c)
-            name_len_ratio       = np.where(name_len_mx == 0, 0.0, name_len_s1 / name_len_mx).astype(np.float32)
-            name_len_diff        = np.abs(name_len_s1 - name_len_c) / np.maximum(name_len_mx, 1)
-            ntc_s1 = _vec_token_count(nt_s1)
-            ntc_c  = _vec_token_count(nt_cand)
-            ntc_mx = np.maximum(ntc_s1, ntc_c)
-            name_token_count_ratio = np.where(ntc_mx == 0, 0.0, ntc_s1 / ntc_mx).astype(np.float32)
-            name_token_count_diff  = np.abs(ntc_s1 - ntc_c) / np.maximum(ntc_mx, 1)
-            name_prefix_match      = _vec_prefix_match(nn_s1, nn_cand)
-            name_bigram_jaccard    = _vec_ngram_jaccard(nn_s1, nn_cand, 2)
-            name_trigram_jaccard   = _vec_ngram_jaccard(nn_s1, nn_cand, 3)
-            name_first_token_match = _vec_first_token_match(nt_s1, nt_cand)
-
-            # ── B. Address features ──────────────────────────────────────
-            addr_ratio       = _paired_scores(na_s1, na_cand, fuzz.ratio)
-            addr_token_sort  = _paired_scores(na_s1, na_cand, fuzz.token_sort_ratio)
-            addr_token_set   = _paired_scores(na_s1, na_cand, fuzz.token_set_ratio)
-            addr_jaccard     = _vec_jaccard_tokens(at_s1, at_cand)
-            addr_token_overlap = _vec_token_overlap(at_s1, at_cand)
-            addr_numeric_jac = _vec_numeric_jaccard(na_s1, na_cand)
-
-            # ── C. Structural features ───────────────────────────────────
-            postal_match  = np.array([
-                float(bool(a) and bool(b) and a == b) for a, b in zip(pc_s1, pc_cand)
-            ], dtype=np.float32)
-            postal_both_empty = np.array([
-                float(not a and not b) for a, b in zip(pc_s1, pc_cand)
-            ], dtype=np.float32)
-            hn_match = np.array([
-                float(bool(a) and bool(b) and a == b) for a, b in zip(hn_s1, hn_cand)
-            ], dtype=np.float32)
-
-            s1_addr_empty   = np.array([float(not a) for a in na_s1], dtype=np.float32)
-            cand_addr_empty = np.array([float(not a) for a in na_cand], dtype=np.float32)
-            both_addr_empty = s1_addr_empty * cand_addr_empty
-            country_match   = np.array([float(a.upper() == b.upper() and bool(a))
-                                        for a, b in zip(co_s1, co_cand)], dtype=np.float32)
-            cand_is_s3 = np.array([float(cid.startswith("S3-")) for cid in cand_id_list],
-                                  dtype=np.float32)
-
-            # ── D. Cross / interaction features ─────────────────────────
-            all_len_s1 = name_len_s1 + np.array([len(a) for a in na_s1], dtype=np.float32)
-            all_len_c  = name_len_c  + np.array([len(a) for a in na_cand], dtype=np.float32)
-            all_mx = np.maximum(all_len_s1, all_len_c)
-            combined_len_ratio = np.where(all_mx == 0, 0.0, all_len_s1 / all_mx).astype(np.float32)
-
-            name_toks_in_addr = _vec_tokens_in_other(nt_s1, at_cand)
-            name_s1_longer  = (name_len_s1 > name_len_c).astype(np.float32)
-            name_cand_longer = (name_len_c > name_len_s1).astype(np.float32)
-
-            # Harmonic mean of name and addr ratio
-            nr, ar = name_ratio, addr_ratio
-            denom = nr + ar
-            name_addr_harmonic = np.where(denom == 0, 0.0, 2 * nr * ar / denom).astype(np.float32)
-
-            name_jaccard_x_addr = name_jaccard * addr_jaccard
-            name_max_sim = np.maximum(name_ratio, np.maximum(name_token_sort, name_token_set))
-            country_mismatch = 1.0 - country_match
-            both_short_name = ((name_len_s1 < 6) & (name_len_c < 6)).astype(np.float32)
-
-            # ── Assemble chunk dict ──────────────────────────────────────
-            chunk_feats = {
-                "s1_id":   chunk["s1_id"].to_list(),
-                "cand_id": cand_id_list,
-                # A. Name
-                "name_ratio":              name_ratio,
-                "name_partial_ratio":      name_partial_ratio,
-                "name_token_sort_ratio":   name_token_sort,
-                "name_token_set_ratio":    name_token_set,
-                "name_jaccard":            name_jaccard,
-                "name_token_overlap":      name_token_overlap,
-                "name_jaro_winkler":       name_jw,
-                "name_len_ratio":          name_len_ratio,
-                "name_len_diff":           name_len_diff.astype(np.float32),
-                "name_token_count_ratio":  name_token_count_ratio,
-                "name_prefix_match":       name_prefix_match,
-                "name_bigram_jaccard":     name_bigram_jaccard,
-                "name_trigram_jaccard":    name_trigram_jaccard,
-                "name_first_token_match":  name_first_token_match,
-                "name_token_count_diff":   name_token_count_diff.astype(np.float32),
-                # B. Address
-                "addr_ratio":              addr_ratio,
-                "addr_token_sort_ratio":   addr_token_sort,
-                "addr_token_set_ratio":    addr_token_set,
-                "addr_jaccard":            addr_jaccard,
-                "addr_token_overlap":      addr_token_overlap,
-                "addr_numeric_jaccard":    addr_numeric_jac,
-                # C. Structural
-                "postal_code_match":       postal_match,
-                "postal_both_empty":       postal_both_empty,
-                "house_num_match":         hn_match,
-                "s1_addr_empty":           s1_addr_empty,
-                "cand_addr_empty":         cand_addr_empty,
-                "both_addr_empty":         both_addr_empty,
-                "country_match":           country_match,
-                "cand_is_s3":              cand_is_s3,
-                # D. Cross
-                "combined_len_ratio":           combined_len_ratio,
-                "name_tokens_in_cand_addr":     name_toks_in_addr,
-                "name_s1_longer":               name_s1_longer,
-                "name_cand_longer":             name_cand_longer,
-                "name_addr_harmonic":           name_addr_harmonic,
-                "name_jaccard_x_addr_jaccard":  name_jaccard_x_addr,
-                "name_max_sim":                 name_max_sim,
-                "country_mismatch_penalty":     country_mismatch,
-                "both_short_name":              both_short_name,
-                "embed_cosine_sim": np.zeros(n, dtype=np.float32),
-            }
+            chunk_feats = compute_chunk_dict(chunk)
             if labels is not None:
-                chunk_feats["label"] = labels[start:start + n]
+                chunk_feats["label"] = labels[start:start + len(chunk)]
 
             all_chunks.append(chunk_feats)
             progress.advance(task)
@@ -382,7 +370,6 @@ def build_flat_pairs(
     s23_df: pl.DataFrame,
     ground_truth: Optional[dict[str, set[str]]] = None,
     max_negatives: int = 2,
-    max_candidates_test: int = 30,
 ) -> pl.DataFrame:
     """
     Explode candidate_pairs → flat (s1_id, cand_id) + joined columns.
@@ -391,7 +378,9 @@ def build_flat_pairs(
       Keeps ALL positive matches plus `max_negatives` hard negatives per entity.
       Reduces 223M explosive pairs down to ~10M clean, balanced training pairs.
     For inference/test:
-      Caps candidate pairs to top `max_candidates_test` per entity to fit safely in memory.
+      Explodes ALL candidates per entity (no alphabetical truncation).
+      Top-K capping and threshold filtering happen AFTER scoring in inference.py,
+      so the model selects candidates by confidence score — not by entity ID order.
     """
     with StageTimer("Build flat pairs (Polars join)", show_sysinfo=False):
         if ground_truth is not None:
@@ -416,7 +405,7 @@ def build_flat_pairs(
                         n_neg += 1
             flat = pl.DataFrame({"s1_id": s1_list, "cand_id": cand_list})
         else:
-            log.info(f"  Inference mode: capping to top-{max_candidates_test} candidates per entity …")
+            log.info("  Inference mode: exploding ALL candidates per entity (no cap) …")
             flat = (
                 candidates_df
                 .filter(pl.col("candidate_entity_ids").is_not_null()
@@ -424,11 +413,11 @@ def build_flat_pairs(
                 .with_columns(
                     pl.col("candidate_entity_ids")
                     .str.split(",")
-                    .list.slice(0, max_candidates_test)
                     .alias("cand_list")
                 )
                 .explode("cand_list")
                 .rename({"source1_entity_id": "s1_id", "cand_list": "cand_id"})
+                .with_columns(pl.col("cand_id").str.strip_chars())
                 .filter(pl.col("cand_id") != "")
             )
 

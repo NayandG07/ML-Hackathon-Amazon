@@ -55,145 +55,138 @@ import polars as pl
 
 from joblib import Parallel, delayed
 from pipeline_utils import StageTimer, console, get_logger, make_progress, print_metrics, print_done, sysinfo
-from feature_engineering import FEATURE_COLS, compute_pair_features, load_entity_lookup
-from parallel_config import CHUNK_INFERENCE, N_THREAD_WORKERS, safe_n_workers
+from fast_features import FEATURE_COLS, build_flat_pairs, compute_chunk_dict
 
 log = get_logger("inference")
 
-
-
 # ---------------------------------------------------------------------------
-# Country cross-check filter
+# Inference core (Vectorized + Batch Memory-Safe)
 # ---------------------------------------------------------------------------
 
-def _country_consistent(c1: str, c2: str) -> bool:
-    """
-    Return True if candidate is consistent with S1 country.
-    Unknown (empty) countries are treated as consistent with everything
-    to avoid dropping France candidates when country is missing.
-    """
-    c1, c2 = (c1 or "").strip().upper(), (c2 or "").strip().upper()
-    if not c1 or not c2:
-        return True
-    return c1 == c2
-
-
-# ---------------------------------------------------------------------------
-# Parallel worker — module-level for Windows joblib compatibility
-# ---------------------------------------------------------------------------
-
-def _score_chunk(
-    chunk: list[tuple[str, str, dict, dict]],
-    apply_country_filter: bool,
-) -> list[tuple[str, str, list[float]]]:
-    """
-    Compute feature vectors for a chunk of (s1_id, cand_id, s1_rec, cand_rec) tuples.
-    Returns (s1_id, cand_id, feature_vector) tuples.
-    rapidfuzz releases GIL → threading backend works well here.
-    """
-    results = []
-    for s1_id, cand_id, s1_rec, cand_rec in chunk:
-        if apply_country_filter and not _country_consistent(
-            s1_rec.get("country", ""), cand_rec.get("country", "")
-        ):
-            continue
-        feat = compute_pair_features(s1_rec, cand_rec)
-        results.append((s1_id, cand_id, [feat.get(f, 0.0) for f in FEATURE_COLS]))
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Inference core
-# ---------------------------------------------------------------------------
-
-def run_inference(
-    candidates_df: pl.DataFrame,
-    s1_lookup: dict[str, dict],
-    s23_lookup: dict[str, dict],
-    model,
+def apply_threshold_cap(
+    entity_scored: dict[str, list[tuple[float, str]]],
     threshold: float,
-    apply_country_filter: bool = True,
+    max_matches_per_entity: int,
+    n_entities: int,
+    total_pairs_scored: int,
 ) -> dict[str, list[str]]:
-    """
-    Score all candidate pairs and apply the threshold.
-
-    Parallel strategy:
-      Stage 1 — Feature computation: chunked threading (rapidfuzz releases GIL)
-      Stage 2 — Model scoring: LightGBM predict_proba with n_jobs=-1 (multi-threaded internally)
-
-    Returns {s1_entity_id: [matched_cand_ids]}
-    """
-    n_workers = safe_n_workers(N_THREAD_WORKERS)
-
-    # ── Stage 1: Flatten all pairs ──────────────────────────────────────
-    log.info("Building flat candidate pair list …")
-    all_pairs: list[tuple[str, str, dict, dict]] = []
+    """Apply threshold + top-K cap to per-entity score lists. Used both inline and for reprocessing saved scores."""
     predictions: dict[str, list[str]] = {}
-
-    for row in candidates_df.iter_rows(named=True):
-        s1_id = row["source1_entity_id"]
-        predictions.setdefault(s1_id, [])
-        cand_str = row.get("candidate_entity_ids", "") or ""
-        if not cand_str:
-            continue
-        s1_rec = s1_lookup.get(s1_id)
-        if s1_rec is None:
-            continue
-        for cid in (c.strip() for c in cand_str.split(",") if c.strip()):
-            cand_rec = s23_lookup.get(cid)
-            if cand_rec is not None:
-                all_pairs.append((s1_id, cid, s1_rec, cand_rec))
-
-    n_pairs = len(all_pairs)
-    log.info(f"  [highlight]{n_pairs:,}[/highlight] pairs to score  "
-             f"— [highlight]{n_workers}[/highlight] threads")
-
-    # ── Stage 2: Parallel feature computation ──────────────────────────
-    chunk_size = max(1, CHUNK_INFERENCE)
-    chunks = [all_pairs[i:i + chunk_size]
-              for i in range(0, n_pairs, chunk_size)]
-
-    with make_progress() as progress:
-        task = progress.add_task(
-            f"  Computing features [{n_workers} threads]",
-            total=len(chunks)
-        )
-        feat_chunks: list[list[tuple]] = []
-        for result in Parallel(n_jobs=n_workers, backend="threading", return_as="generator")(
-            delayed(_score_chunk)(c, apply_country_filter) for c in chunks
-        ):
-            feat_chunks.append(result)
-            progress.advance(task)
-
-    flat_scored = [item for chunk in feat_chunks for item in chunk]
-
-    if not flat_scored:
-        log.warning("No scorable pairs found — check preprocessing and blocking.")
-        return predictions
-
-    # ── Stage 3: Batch LGB prediction (multi-threaded internally) ──────
-    log.info(f"  Running LightGBM on [highlight]{len(flat_scored):,}[/highlight] pairs …")
-    s1_ids_flat   = [t[0] for t in flat_scored]
-    cand_ids_flat = [t[1] for t in flat_scored]
-    X_all = np.array([t[2] for t in flat_scored], dtype=np.float32)
-
-    # LGB predict_proba uses n_jobs=-1 internally (BLAS multi-thread)
-    scores_all = model.predict_proba(X_all)[:, 1]
-
     total_matches = 0
-    for s1_id, cand_id, score in zip(s1_ids_flat, cand_ids_flat, scores_all):
-        if score >= threshold:
-            predictions[s1_id].append(cand_id)
-            total_matches += 1
+    for sid, scored_list in entity_scored.items():
+        above = [(sc, cid) for sc, cid in scored_list if sc >= threshold]
+        if not above:
+            predictions[sid] = []
+        else:
+            above.sort(reverse=True)
+            kept = above[:max_matches_per_entity]
+            predictions[sid] = [cid for _, cid in kept]
+            total_matches += len(kept)
 
     n_singletons = sum(1 for v in predictions.values() if not v)
     print_metrics("Inference Results", {
-        "Candidate pairs scored": f"{len(flat_scored):,}",
+        "Candidate pairs scored": f"{total_pairs_scored:,}",
         "Predicted matches":      f"{total_matches:,}",
         "Predicted singletons":   f"{n_singletons:,}",
-        "Match rate":             f"{total_matches / max(len(flat_scored), 1) * 100:.2f}%",
+        "Avg matches / entity":   f"{total_matches / max(n_entities, 1):.2f}",
+        "Match rate":             f"{total_matches / max(total_pairs_scored, 1) * 100:.2f}%",
     })
     return predictions
+
+
+def run_inference(
+    candidates_df: pl.DataFrame,
+    s1_df: pl.DataFrame,
+    s23_df: pl.DataFrame,
+    model,
+    threshold: float,
+    apply_country_filter: bool = True,
+    entity_batch_size: int = 10_000,
+    max_matches_per_entity: int = 10,
+    scores_save_path: Optional[str] = None,
+    min_save_threshold: float = 0.40,
+) -> dict[str, list[str]]:
+    """
+    Score candidate pairs in streaming entity batches using C++ rapidfuzz & LightGBM.
+
+    Post-scoring policy (F0.5 precision-aware):
+      - For each entity, collect all candidates with score >= min_save_threshold.
+      - Optionally save those raw scores to a parquet for offline re-calibration.
+      - Then apply threshold + top-K cap: keep candidates >= threshold, sorted desc, top max_matches_per_entity.
+
+    Setting scores_save_path saves a (s1_id, cand_id, score) parquet so future
+    threshold/K experiments take seconds instead of hours.
+    """
+    n_entities = len(candidates_df)
+    # Initialize accumulator from s1_df (small, already loaded) — NOT from the
+    # giant 2.27 GB candidates_df which would OOM on .to_list()
+    entity_scored: dict[str, list[tuple[float, str]]] = {
+        s1_id: [] for s1_id in s1_df["entity_id"].to_list()
+    }
+
+    n_batches = (n_entities + entity_batch_size - 1) // entity_batch_size
+    total_pairs_scored = 0
+    log.info(f"Scoring [highlight]{n_entities:,}[/highlight] entities in {n_batches} streaming batches (batch_size={entity_batch_size:,}) …")
+    if scores_save_path:
+        log.info(f"  Saving raw scores (>={min_save_threshold:.2f}) → [highlight]{scores_save_path}[/highlight]")
+
+    with make_progress() as progress:
+        task = progress.add_task("  Inference streaming batches", total=n_batches)
+        for b_idx in range(n_batches):
+            b_start = b_idx * entity_batch_size
+            cand_batch = candidates_df.slice(b_start, entity_batch_size)
+
+            # Build flat pairs only for this batch of entities
+            flat_df = build_flat_pairs(cand_batch, s1_df, s23_df, ground_truth=None)
+
+            if len(flat_df) == 0:
+                progress.advance(task)
+                continue
+
+            if apply_country_filter:
+                flat_df = flat_df.filter(
+                    (pl.col("country_s1") == "")
+                    | (pl.col("country_cand") == "")
+                    | (pl.col("country_s1").str.to_uppercase() == pl.col("country_cand").str.to_uppercase())
+                )
+
+            n_pairs = len(flat_df)
+            total_pairs_scored += n_pairs
+
+            # Featurise batch
+            chunk_dict = compute_chunk_dict(flat_df)
+
+            # Build feature matrix in FEATURE_COLS order
+            X = np.column_stack([chunk_dict[c] for c in FEATURE_COLS])
+
+            # Model prediction — scores in [0, 1]
+            scores = model.predict_proba(X)[:, 1]
+
+            # Accumulate per-entity (score, cand_id) for candidates above min_save_threshold
+            s1_arr = chunk_dict["s1_id"]
+            c_arr  = chunk_dict["cand_id"]
+            for sid, cid, sc in zip(s1_arr, c_arr, scores):
+                if sc >= min_save_threshold:
+                    entity_scored[sid].append((float(sc), cid))
+
+            del flat_df, chunk_dict, X, scores
+            progress.advance(task)
+
+    # Optionally save raw scores parquet for offline re-calibration
+    if scores_save_path:
+        log.info(f"Saving raw scores to [highlight]{scores_save_path}[/highlight] …")
+        s1_out, c_out, sc_out = [], [], []
+        for sid, scored_list in entity_scored.items():
+            for sc, cid in scored_list:
+                s1_out.append(sid); c_out.append(cid); sc_out.append(sc)
+        pl.DataFrame({
+            "s1_id": s1_out, "cand_id": c_out, "score": np.array(sc_out, dtype=np.float32)
+        }).write_parquet(scores_save_path)
+        log.info(f"  Saved {len(s1_out):,} scored pairs.")
+        del s1_out, c_out, sc_out
+
+    return apply_threshold_cap(entity_scored, threshold, max_matches_per_entity, n_entities, total_pairs_scored)
+
 
 
 
@@ -231,7 +224,14 @@ def main():
     parser.add_argument("--candidate-file", default="output/candidate_pairs.tsv")
     parser.add_argument("--model-dir", default="output/models")
     parser.add_argument("--output-dir", default="output")
-    parser.add_argument("--threshold-override", type=float, default=None)
+    parser.add_argument("--threshold-override", type=float, default=None,
+                        help="Override the decision threshold from model_meta.json")
+    parser.add_argument("--max-matches-per-entity", type=int, default=5,
+                        help="Max candidates to predict per S1 entity (top-K by score). "
+                             "Ground truth median=4, max=11. Default 5.")
+    parser.add_argument("--entity-batch-size", type=int, default=10_000,
+                        help="Entities per inference batch. 10K × ~100 cands = ~1M pairs "
+                             "→ ~150 MB numpy RAM. Reduce if OOM.")
     parser.add_argument("--no-country-filter", action="store_true")
     args = parser.parse_args()
 
@@ -248,7 +248,9 @@ def main():
             meta = json.load(f)
 
         threshold = args.threshold_override or meta["threshold"]
-        log.info(f"Decision threshold: [metric]{threshold:.4f}[/metric]")
+        log.info(f"Decision threshold       : [metric]{threshold:.4f}[/metric]")
+        log.info(f"Max matches per entity   : [metric]{args.max_matches_per_entity}[/metric]")
+        log.info(f"Entity batch size        : [metric]{args.entity_batch_size:,}[/metric]")
 
         sysinfo(show=True)
 
@@ -258,8 +260,6 @@ def main():
         s3_df = pl.read_parquet(str(proc_dir / "test_s3.parquet"))
         s23_df = pl.concat([s2_df, s3_df])
 
-        s1_lookup = load_entity_lookup(s1_df)
-        s23_lookup = load_entity_lookup(s23_df)
         test_s1_ids = s1_df["entity_id"].to_list()
         log.info(f"  Test S1 entities: [highlight]{len(test_s1_ids):,}[/highlight]")
 
@@ -269,10 +269,15 @@ def main():
             null_values=[""], infer_schema_length=100,
         )
 
+        scores_path = str(out_dir / "scores_raw.parquet")
         predictions = run_inference(
-            candidates_df, s1_lookup, s23_lookup, model,
+            candidates_df, s1_df, s23_df, model,
             threshold=threshold,
             apply_country_filter=not args.no_country_filter,
+            entity_batch_size=args.entity_batch_size,
+            max_matches_per_entity=args.max_matches_per_entity,
+            scores_save_path=scores_path,
+            min_save_threshold=0.40,
         )
 
         for s1_id in test_s1_ids:
@@ -281,7 +286,7 @@ def main():
         results_df = build_matching_results(predictions, test_s1_ids)
 
     out_path = out_dir / "matching_results.tsv"
-    results_df.write_csv(str(out_path), separator="\t")
+    results_df.write_csv(str(out_path), separator="\t", quote_style="never")
     log.info(f"Saved → [highlight]{out_path}[/highlight]")
 
     n_singletons = results_df.filter(pl.col("matched_entity_ids") == "").height
@@ -296,4 +301,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
