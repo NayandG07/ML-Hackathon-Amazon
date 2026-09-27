@@ -69,19 +69,65 @@ def apply_threshold_cap(
     max_matches_per_entity: int,
     n_entities: int,
     total_pairs_scored: int,
+    entity_pair_features: Optional[dict[str, dict[str, tuple[float, float, float]]]] = None,
+    min_name_sim: float = 0.40,
+    min_addr_sim: float = 0.25,
 ) -> dict[str, list[str]]:
-    """Apply threshold + top-K cap to per-entity score lists. Used both inline and for reprocessing saved scores."""
+    """
+    Apply threshold + Dual-Agreement Gate + top-K cap + Exclusive 1-to-N Assignment.
+
+    Dual-Agreement Gate:
+      A match must have BOTH name agreement AND location agreement:
+        name_token_sort_ratio >= min_name_sim
+        AND (addr_token_sort_ratio >= min_addr_sim OR postal_code_match == 1.0)
+      This eliminates false positives caused by high name overlap + wrong city/country.
+
+    Exclusive 1-to-N Assignment:
+      Each S2/S3 entity can only be assigned to ONE S1 entity (the one with the
+      highest model score). Prevents duplicate assignments across S1 entities,
+      which guarantees false positives for lower-ranked S1 matches.
+
+    entity_pair_features: {s1_id: {cand_id: (name_sim, addr_sim, postal_match)}}
+      If None, the Dual-Agreement Gate is skipped (gates only via threshold).
+    """
+    # Phase 1: collect all (score, s1_id, cand_id) across all entities for exclusive assignment
+    all_predictions: list[tuple[float, str, str]] = []
+    for sid, scored_list in entity_scored.items():
+        feats = entity_pair_features.get(sid, {}) if entity_pair_features else {}
+        for sc, cid in scored_list:
+            if sc < threshold:
+                continue
+            # Dual-Agreement Gate:
+            # 1. Name agreement is ALWAYS required (postal code does NOT replace name!)
+            # 2. Location agreement requires EITHER address string similarity OR postal code match
+            if feats and cid in feats:
+                name_sim, addr_sim, postal_match = feats[cid]
+                if name_sim < min_name_sim:
+                    continue  # Name is completely different → guaranteed non-match
+                if addr_sim < min_addr_sim and postal_match < 1.0:
+                    continue  # Different location / state / city → non-match
+            all_predictions.append((sc, sid, cid))
+
+    # Phase 2: Exclusive 1-to-N Assignment
+    # Sort all candidates globally by score desc, then greedily assign each cand_id to
+    # the highest-scoring S1 entity (each cand_id can only be used once)
+    all_predictions.sort(reverse=True)
+    cand_claimed: dict[str, str] = {}  # cand_id -> winning s1_id
+    entity_matches: dict[str, list[tuple[float, str]]] = {sid: [] for sid in entity_scored}
+    for sc, sid, cid in all_predictions:
+        if cid in cand_claimed:
+            continue  # already assigned to a higher-scoring S1 entity
+        cand_claimed[cid] = sid
+        entity_matches[sid].append((sc, cid))
+
+    # Phase 3: top-K cap per entity
     predictions: dict[str, list[str]] = {}
     total_matches = 0
-    for sid, scored_list in entity_scored.items():
-        above = [(sc, cid) for sc, cid in scored_list if sc >= threshold]
-        if not above:
-            predictions[sid] = []
-        else:
-            above.sort(reverse=True)
-            kept = above[:max_matches_per_entity]
-            predictions[sid] = [cid for _, cid in kept]
-            total_matches += len(kept)
+    for sid, scored_list in entity_matches.items():
+        scored_list.sort(reverse=True)
+        kept = scored_list[:max_matches_per_entity]
+        predictions[sid] = [cid for _, cid in kept]
+        total_matches += len(kept)
 
     n_singletons = sum(1 for v in predictions.values() if not v)
     print_metrics("Inference Results", {
@@ -92,6 +138,7 @@ def apply_threshold_cap(
         "Match rate":             f"{total_matches / max(total_pairs_scored, 1) * 100:.2f}%",
     })
     return predictions
+
 
 
 def run_inference(
@@ -105,6 +152,8 @@ def run_inference(
     max_matches_per_entity: int = 10,
     scores_save_path: Optional[str] = None,
     min_save_threshold: float = 0.40,
+    min_name_sim: float = 0.40,
+    min_addr_sim: float = 0.25,
 ) -> dict[str, list[str]]:
     """
     Score candidate pairs in streaming entity batches using C++ rapidfuzz & LightGBM.
@@ -118,10 +167,12 @@ def run_inference(
     threshold/K experiments take seconds instead of hours.
     """
     n_entities = len(candidates_df)
-    # Initialize accumulator from s1_df (small, already loaded) — NOT from the
-    # giant 2.27 GB candidates_df which would OOM on .to_list()
     entity_scored: dict[str, list[tuple[float, str]]] = {
         s1_id: [] for s1_id in s1_df["entity_id"].to_list()
+    }
+    # Per-entity per-candidate gate features: {s1_id: {cand_id: (name_sim, addr_sim, postal_match)}}
+    entity_pair_feats: dict[str, dict[str, tuple[float, float, float]]] = {
+        s1_id: {} for s1_id in s1_df["entity_id"].to_list()
     }
 
     n_batches = (n_entities + entity_batch_size - 1) // entity_batch_size
@@ -162,12 +213,16 @@ def run_inference(
             # Model prediction — scores in [0, 1]
             scores = model.predict_proba(X)[:, 1]
 
-            # Accumulate per-entity (score, cand_id) for candidates above min_save_threshold
-            s1_arr = chunk_dict["s1_id"]
-            c_arr  = chunk_dict["cand_id"]
-            for sid, cid, sc in zip(s1_arr, c_arr, scores):
+            # Accumulate per-entity (score, cand_id) + gate features for candidates above threshold
+            s1_arr   = chunk_dict["s1_id"]
+            c_arr    = chunk_dict["cand_id"]
+            name_sim = chunk_dict["name_token_sort_ratio"]
+            addr_sim = chunk_dict["addr_token_sort_ratio"]
+            postal   = chunk_dict["postal_code_match"]
+            for sid, cid, sc, ns, ads, pm in zip(s1_arr, c_arr, scores, name_sim, addr_sim, postal):
                 if sc >= min_save_threshold:
                     entity_scored[sid].append((float(sc), cid))
+                    entity_pair_feats[sid][cid] = (float(ns), float(ads), float(pm))
 
             del flat_df, chunk_dict, X, scores
             progress.advance(task)
@@ -185,7 +240,12 @@ def run_inference(
         log.info(f"  Saved {len(s1_out):,} scored pairs.")
         del s1_out, c_out, sc_out
 
-    return apply_threshold_cap(entity_scored, threshold, max_matches_per_entity, n_entities, total_pairs_scored)
+    return apply_threshold_cap(
+        entity_scored, threshold, max_matches_per_entity, n_entities, total_pairs_scored,
+        entity_pair_features=entity_pair_feats,
+        min_name_sim=min_name_sim,
+        min_addr_sim=min_addr_sim,
+    )
 
 
 
@@ -232,6 +292,10 @@ def main():
     parser.add_argument("--entity-batch-size", type=int, default=10_000,
                         help="Entities per inference batch. 10K × ~100 cands = ~1M pairs "
                              "→ ~150 MB numpy RAM. Reduce if OOM.")
+    parser.add_argument("--min-name-sim", type=float, default=0.40,
+                        help="Minimum name_token_sort_ratio for Dual-Agreement Gate (default 0.40)")
+    parser.add_argument("--min-addr-sim", type=float, default=0.25,
+                        help="Minimum addr_token_sort_ratio for Dual-Agreement Gate (default 0.25)")
     parser.add_argument("--no-country-filter", action="store_true")
     args = parser.parse_args()
 
@@ -251,6 +315,8 @@ def main():
         log.info(f"Decision threshold       : [metric]{threshold:.4f}[/metric]")
         log.info(f"Max matches per entity   : [metric]{args.max_matches_per_entity}[/metric]")
         log.info(f"Entity batch size        : [metric]{args.entity_batch_size:,}[/metric]")
+        log.info(f"Dual-Gate min name sim   : [metric]{args.min_name_sim:.2f}[/metric]")
+        log.info(f"Dual-Gate min addr sim   : [metric]{args.min_addr_sim:.2f}[/metric]")
 
         sysinfo(show=True)
 
@@ -278,6 +344,8 @@ def main():
             max_matches_per_entity=args.max_matches_per_entity,
             scores_save_path=scores_path,
             min_save_threshold=0.40,
+            min_name_sim=args.min_name_sim,
+            min_addr_sim=args.min_addr_sim,
         )
 
         for s1_id in test_s1_ids:

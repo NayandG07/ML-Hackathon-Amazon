@@ -198,13 +198,15 @@ class TFIDFRetriever:
 
     def __init__(
         self,
-        ngram_range: tuple[int, int] = (1, 2),
-        max_features: int = 200_000,
-        top_k: int = 50,
-    ):
+        ngram_range: tuple[int, int] = (2, 3),    # char_wb 2-3-grams: handles typos, abbrevs, transliterations
+        max_features: int = 150_000,               # 150K is safe on 24 GB for 10M entities
+        top_k: int = 100,                          # retrieve 100 candidates (was 50)
+        analyzer: str = "char_wb",                 # char within word boundaries — avoids cross-space n-grams
+    ):                                             # that explode memory on large corpora
         self.ngram_range = ngram_range
         self.max_features = max_features
         self.top_k = top_k
+        self.analyzer = analyzer
         # Per-country data
         self._vectorisers: dict[str, TfidfVectorizer] = {}
         self._matrices: dict[str, csr_matrix] = {}   # normalised L2
@@ -228,17 +230,17 @@ class TFIDFRetriever:
             ids = [r["entity_id"] for r in rows]
             vec = TfidfVectorizer(
                 ngram_range=self.ngram_range,
-                max_features=150_000,   # 150K discriminative vocab (was 200K)
+                max_features=self.max_features,
                 sublinear_tf=True,
-                analyzer="word",
-                min_df=2,               # skip tokens appearing in only 1 doc (noise)
-                max_df=0.01,            # skip tokens in >1% of docs — "pvt","ltd","road","inc" etc.
-                stop_words="english",   # strip "the","of","and" etc.
+                analyzer=self.analyzer,  # "char_wb" — within-word char n-grams, memory-efficient
+                min_df=2,                # skip n-grams in only 1 doc (noise)
+                max_df=0.10,             # keep industry terms: "hotel","clinic","motors","road"
+                                         # (was 0.01 — incorrectly pruned many useful terms)
             )
             try:
                 mat = vec.fit_transform(corpus)
             except ValueError:
-                # Empty corpus (all stopwords)
+                # Empty corpus
                 continue
             mat_norm = normalize(mat, norm="l2", copy=False)
             self._vectorisers[country] = vec
@@ -246,7 +248,7 @@ class TFIDFRetriever:
             self._id_lists[country] = ids
             log.info(
                 f"  TF-IDF [{country}]: {len(ids):,} docs,"
-                f" vocab={mat.shape[1]:,}"
+                f" vocab={mat.shape[1]:,}, analyzer={self.analyzer!r}"
             )
 
     def query(self, s1_row: dict) -> set[str]:
@@ -679,11 +681,11 @@ def main():
     parser.add_argument("--processed-dir", default="dataset/processed")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--split", default="test", choices=["train", "test"])
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-k", type=int, default=100)
     parser.add_argument("--minhash-threshold", type=float, default=0.20)
     parser.add_argument("--no-minhash", action="store_true")
-    parser.add_argument("--max-candidates", type=int, default=200)
-    parser.add_argument("--artifacts-dir", default="output/artifacts")
+    parser.add_argument("--max-candidates", type=int, default=300)
+    parser.add_argument("--artifacts-dir", default="output/artifacts_v2")
     args = parser.parse_args()
 
     proc_dir = Path(args.processed_dir)

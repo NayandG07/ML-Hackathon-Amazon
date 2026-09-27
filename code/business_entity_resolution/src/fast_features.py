@@ -369,14 +369,18 @@ def build_flat_pairs(
     s1_df: pl.DataFrame,
     s23_df: pl.DataFrame,
     ground_truth: Optional[dict[str, set[str]]] = None,
-    max_negatives: int = 2,
+    max_negatives: int = 6,   # increased from 2 → 6 hard negatives per entity
 ) -> pl.DataFrame:
     """
     Explode candidate_pairs → flat (s1_id, cand_id) + joined columns.
 
     For training (ground_truth provided):
       Keeps ALL positive matches plus `max_negatives` hard negatives per entity.
-      Reduces 223M explosive pairs down to ~10M clean, balanced training pairs.
+      Negatives are sampled to ensure difficulty spread:
+        - Up to max_negatives//2 from the first half of candidates (confuser-heavy zone)
+        - Up to max_negatives//2 from the second half (easy negatives for calibration)
+      This mimics the real inference distribution better than 2 easy negatives.
+      Reduces 223M explosive pairs down to ~18M clean training pairs.
     For inference/test:
       Explodes ALL candidates per entity (no alphabetical truncation).
       Top-K capping and threshold filtering happen AFTER scoring in inference.py,
@@ -387,6 +391,7 @@ def build_flat_pairs(
             log.info("  Sampling all true positive matches + hard negatives for training …")
             s1_list: list[str] = []
             cand_list: list[str] = []
+            half_neg = max(1, max_negatives // 2)
             for row in candidates_df.iter_rows(named=True):
                 s1_id = row["source1_entity_id"]
                 raw_c = row.get("candidate_entity_ids") or ""
@@ -394,15 +399,31 @@ def build_flat_pairs(
                     continue
                 c_all = raw_c.split(",")
                 true_m = ground_truth.get(s1_id, set())
-                n_neg = 0
+                # Collect true positives
+                negs: list[str] = []
                 for c in c_all:
                     if c in true_m:
                         s1_list.append(s1_id)
                         cand_list.append(c)
-                    elif n_neg < max_negatives:
-                        s1_list.append(s1_id)
-                        cand_list.append(c)
-                        n_neg += 1
+                    else:
+                        negs.append(c)
+                # Hard negatives: first half of list (blocking put confusers near top)
+                # Easy negatives: second half of list
+                n = len(negs)
+                hard = negs[: n // 2]
+                easy = negs[n // 2 :]
+                chosen: list[str] = []
+                for neg in hard:
+                    if len(chosen) >= half_neg:
+                        break
+                    chosen.append(neg)
+                for neg in easy:
+                    if len(chosen) >= max_negatives:
+                        break
+                    chosen.append(neg)
+                for c in chosen:
+                    s1_list.append(s1_id)
+                    cand_list.append(c)
             flat = pl.DataFrame({"s1_id": s1_list, "cand_id": cand_list})
         else:
             log.info("  Inference mode: exploding ALL candidates per entity (no cap) …")

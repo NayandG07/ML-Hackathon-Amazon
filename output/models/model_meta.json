@@ -1,5 +1,5 @@
 {
-  "threshold": 0.6206532663316583,
+  "threshold": 0.8028643216080402,
   "n_features": 39,
   "feature_cols": [
     "name_ratio",
@@ -42,6 +42,6 @@
     "both_short_name",
     "embed_cosine_sim"
   ],
-  "n_estimators": 2000,
-  "best_iteration": 2000
+  "n_estimators": 1500,
+  "best_iteration": 1500
 }
