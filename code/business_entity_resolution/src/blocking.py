@@ -219,8 +219,9 @@ class TFIDFRetriever:
         # Name is more discriminative — repeat it to upweight
         return f"{name} {name} {addr}".strip()
 
-    # Max entities per TF-IDF shard — keeps peak memory < 8 GB for char_wb
-    SHARD_SIZE: int = 800_000
+    # Max entities per TF-IDF shard — keeps peak memory < 4 GB per shard
+    # With char_wb (2,3)-grams and 150K vocab, each 400K-entity shard uses ~4 GB
+    SHARD_SIZE: int = 400_000
 
     def fit(self, df: pl.DataFrame) -> None:
         """

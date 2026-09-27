@@ -312,6 +312,8 @@ def main():
     parser.add_argument("--embed-scores-file", default=None,
                         help="Optional parquet file with precomputed (s1_id, cand_id, embed_cosine_sim) columns."
                              " When provided, fills the embed_cosine_sim feature for better accuracy.")
+    parser.add_argument("--model-name", default="lgbm_model.pkl",
+                        help="Model filename inside model-dir (default lgbm_model.pkl)")
     args = parser.parse_args()
 
     proc_dir = Path(args.processed_dir)
@@ -320,13 +322,19 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with StageTimer("Inference Pipeline"):
-        log.info(f"Loading model from [highlight]{model_dir / 'lgbm_model.pkl'}[/highlight] …")
-        with open(str(model_dir / "lgbm_model.pkl"), "rb") as f:
+        model_path = model_dir / args.model_name
+        log.info(f"Loading model from [highlight]{model_path}[/highlight] …")
+        with open(str(model_path), "rb") as f:
             model = pickle.load(f)
-        with open(str(model_dir / "model_meta.json")) as f:
-            meta = json.load(f)
 
-        threshold = args.threshold_override or meta["threshold"]
+        meta_name = "model_meta_v2.json" if "v2" in args.model_name else "model_meta.json"
+        meta_path = model_dir / meta_name
+        if meta_path.exists():
+            with open(str(meta_path)) as f:
+                meta = json.load(f)
+            threshold = args.threshold_override or meta.get("threshold", 0.50)
+        else:
+            threshold = args.threshold_override or 0.50
         log.info(f"Decision threshold       : [metric]{threshold:.4f}[/metric]")
         log.info(f"Max matches per entity   : [metric]{args.max_matches_per_entity}[/metric]")
         log.info(f"Entity batch size        : [metric]{args.entity_batch_size:,}[/metric]")
