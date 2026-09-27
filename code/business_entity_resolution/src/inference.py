@@ -155,6 +155,7 @@ def run_inference(
     min_name_sim: float = 0.40,
     min_addr_sim: float = 0.25,
     embed_scores_lookup: Optional[dict] = None,   # {(s1_id, cand_id): cosine_sim}
+    embed_data: Optional[tuple] = None,            # (s1_embeds, s23_embeds, s1_idx, s23_idx)
 ) -> dict[str, list[str]]:
     """
     Score candidate pairs in streaming entity batches using C++ rapidfuzz & LightGBM.
@@ -208,8 +209,20 @@ def run_inference(
             # Featurise batch
             chunk_dict = compute_chunk_dict(flat_df)
 
-            # Inject precomputed embedding cosine similarities if available
-            if embed_scores_lookup is not None:
+            # Inject embedding cosine similarities if available (on-the-fly from mmap or precomputed lookup)
+            if embed_data is not None:
+                s1_embeds, s23_embeds, s1_idx, s23_idx = embed_data
+                s1_ids_arr   = chunk_dict["s1_id"]
+                cand_ids_arr = chunk_dict["cand_id"]
+                n_chunk = len(s1_ids_arr)
+                embed_sims = np.zeros(n_chunk, dtype=np.float32)
+                for j in range(n_chunk):
+                    si = s1_idx.get(s1_ids_arr[j])
+                    ci = s23_idx.get(cand_ids_arr[j])
+                    if si is not None and ci is not None:
+                        embed_sims[j] = float(np.dot(s1_embeds[si], s23_embeds[ci]))
+                chunk_dict["embed_cosine_sim"] = embed_sims
+            elif embed_scores_lookup is not None:
                 s1_ids_arr  = chunk_dict["s1_id"]
                 cand_ids_arr = chunk_dict["cand_id"]
                 embed_sims = np.array(
@@ -219,24 +232,37 @@ def run_inference(
                 )
                 chunk_dict["embed_cosine_sim"] = embed_sims
 
-            # Build feature matrix in FEATURE_COLS order
-            X = np.column_stack([chunk_dict[c] for c in FEATURE_COLS])
+            # Fast Pre-Gate: only evaluate the model on pairs that can pass the gate or have strong semantic similarity
+            name_sim_arr  = chunk_dict["name_token_sort_ratio"]
+            addr_sim_arr  = chunk_dict["addr_token_sort_ratio"]
+            postal_arr    = chunk_dict["postal_code_match"]
+            embed_sim_arr = chunk_dict.get("embed_cosine_sim")
 
-            # Model prediction — scores in [0, 1]
-            scores = model.predict_proba(X)[:, 1]
+            if embed_sim_arr is not None:
+                eval_mask = ((name_sim_arr >= (min_name_sim - 0.05)) & ((addr_sim_arr >= (min_addr_sim - 0.05)) | (postal_arr >= 1.0))) | (embed_sim_arr >= 0.72)
+            else:
+                eval_mask = (name_sim_arr >= (min_name_sim - 0.05)) & ((addr_sim_arr >= (min_addr_sim - 0.05)) | (postal_arr >= 1.0))
 
-            # Accumulate per-entity (score, cand_id) + gate features for candidates above threshold
-            s1_arr   = chunk_dict["s1_id"]
-            c_arr    = chunk_dict["cand_id"]
-            name_sim = chunk_dict["name_token_sort_ratio"]
-            addr_sim = chunk_dict["addr_token_sort_ratio"]
-            postal   = chunk_dict["postal_code_match"]
-            for sid, cid, sc, ns, ads, pm in zip(s1_arr, c_arr, scores, name_sim, addr_sim, postal):
-                if sc >= min_save_threshold:
-                    entity_scored[sid].append((float(sc), cid))
-                    entity_pair_feats[sid][cid] = (float(ns), float(ads), float(pm))
+            eval_indices = np.where(eval_mask)[0]
 
-            del flat_df, chunk_dict, X, scores
+            if len(eval_indices) > 0:
+                # Build feature matrix only for plausible pairs
+                X = np.column_stack([chunk_dict[c][eval_indices] for c in FEATURE_COLS])
+                scores_sub = model.predict_proba(X)[:, 1]
+
+                s1_arr  = chunk_dict["s1_id"][eval_indices]
+                c_arr   = chunk_dict["cand_id"][eval_indices]
+                ns_sub  = name_sim_arr[eval_indices]
+                ads_sub = addr_sim_arr[eval_indices]
+                pm_sub  = postal_arr[eval_indices]
+
+                for sid, cid, sc, ns, ads, pm in zip(s1_arr, c_arr, scores_sub, ns_sub, ads_sub, pm_sub):
+                    if sc >= min_save_threshold:
+                        entity_scored[sid].append((float(sc), cid))
+                        entity_pair_feats[sid][cid] = (float(ns), float(ads), float(pm))
+                del X, scores_sub
+
+            del flat_df, chunk_dict
             progress.advance(task)
 
     # Optionally save raw scores parquet for offline re-calibration
@@ -314,6 +340,8 @@ def main():
                              " When provided, fills the embed_cosine_sim feature for better accuracy.")
     parser.add_argument("--model-name", default="lgbm_model.pkl",
                         help="Model filename inside model-dir (default lgbm_model.pkl)")
+    parser.add_argument("--embeddings-dir", default=None,
+                        help="Directory containing test_s1_embeds.npy and test_s23_embeds.npy for fast on-the-fly scoring")
     args = parser.parse_args()
 
     proc_dir = Path(args.processed_dir)
@@ -369,6 +397,23 @@ def main():
             }
             log.info(f"  Loaded [highlight]{len(embed_scores_lookup):,}[/highlight] embedding similarity pairs")
 
+        # Load mmap embeddings for on-the-fly cosine calculation if provided
+        embed_data = None
+        if args.embeddings_dir and Path(args.embeddings_dir).exists():
+            emb_dir = Path(args.embeddings_dir)
+            s1_f = emb_dir / "test_s1_embeds.npy"
+            s23_f = emb_dir / "test_s23_embeds.npy"
+            if s1_f.exists() and s23_f.exists():
+                log.info(f"Loading mmap embeddings from [highlight]{emb_dir}[/highlight] …")
+                s1_emb = np.load(str(s1_f), mmap_mode="r")
+                s1_ids = np.load(str(emb_dir / "test_s1_ids.npy"), allow_pickle=True)
+                s23_emb = np.load(str(s23_f), mmap_mode="r")
+                s23_ids = np.load(str(emb_dir / "test_s23_ids.npy"), allow_pickle=True)
+                s1_idx = {eid: i for i, eid in enumerate(s1_ids)}
+                s23_idx = {eid: i for i, eid in enumerate(s23_ids)}
+                embed_data = (s1_emb, s23_emb, s1_idx, s23_idx)
+                log.info(f"  Ready for on-the-fly cosine scoring ({len(s1_ids):,} S1, {len(s23_ids):,} S23)")
+
         scores_path = str(out_dir / "scores_raw.parquet")
         predictions = run_inference(
             candidates_df, s1_df, s23_df, model,
@@ -381,6 +426,7 @@ def main():
             min_name_sim=args.min_name_sim,
             min_addr_sim=args.min_addr_sim,
             embed_scores_lookup=embed_scores_lookup,
+            embed_data=embed_data,
         )
 
         for s1_id in test_s1_ids:

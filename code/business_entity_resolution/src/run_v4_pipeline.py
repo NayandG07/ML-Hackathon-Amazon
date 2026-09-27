@@ -75,25 +75,9 @@ def main():
         log.warning(f"Model {model_name} not found yet. Falling back to lgbm_model.pkl if available.")
         model_name = "lgbm_model.pkl"
 
-    # Step 1: Score embeddings on candidate pairs
+    # Step 1: Streaming Inference with LightGBM v2 + Dual-Gate + On-The-Fly Embeddings
     log.info("=" * 60)
-    log.info("STEP 1: Computing candidate embedding cosine similarities")
-    log.info("=" * 60)
-    run(
-        [
-            PYTHON, str(SRC / "embed_features.py"), "score",
-            "--embeddings-dir", str(OUT / "embeddings"),
-            "--candidate-file", str(candidate_file),
-            "--output-file", str(embed_scores_file),
-            "--split", "test",
-        ],
-        "Score candidate embeddings",
-        log_file=str(OUT / "embed_score_test.log"),
-    )
-
-    # Step 2: Optimal inference threshold and max_k
-    log.info("=" * 60)
-    log.info("STEP 2: Streaming Inference with LightGBM + Dual-Gate + Embeddings")
+    log.info("STEP 1: Streaming Inference with LightGBM v2 + Dual-Gate + Embeddings")
     log.info("=" * 60)
 
     meta_path = OUT / "models" / meta_name
@@ -119,9 +103,9 @@ def main():
             "--entity-batch-size", "10000",
             "--min-name-sim", "0.40",
             "--min-addr-sim", "0.25",
-            "--embed-scores-file", str(embed_scores_file),
+            "--embeddings-dir", str(OUT / "embeddings"),
         ],
-        "Streaming inference",
+        "Streaming inference with on-the-fly embeddings",
         log_file=str(OUT / "inference_v4.log"),
     )
 
