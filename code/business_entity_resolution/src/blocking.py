@@ -219,54 +219,90 @@ class TFIDFRetriever:
         # Name is more discriminative — repeat it to upweight
         return f"{name} {name} {addr}".strip()
 
+    # Max entities per TF-IDF shard — keeps peak memory < 8 GB for char_wb
+    SHARD_SIZE: int = 800_000
+
     def fit(self, df: pl.DataFrame) -> None:
-        """Fit one TF-IDF vectoriser per country."""
+        """
+        Fit TF-IDF vectoriser(s) per country.
+        Large countries (India ~4.7M) are automatically split into shards of
+        SHARD_SIZE entities each.  Each shard is stored under a key like
+        "India__shard0", "India__shard1", …  Query methods handle the fan-out.
+        """
         for country in df["country"].unique().to_list():
             sub = df.filter(pl.col("country") == country)
             if len(sub) == 0:
                 continue
-            rows = sub.to_dicts()
-            corpus = [self._corpus_string(r) for r in rows]
-            ids = [r["entity_id"] for r in rows]
-            vec = TfidfVectorizer(
-                ngram_range=self.ngram_range,
-                max_features=self.max_features,
-                sublinear_tf=True,
-                analyzer=self.analyzer,  # "char_wb" — within-word char n-grams, memory-efficient
-                min_df=2,                # skip n-grams in only 1 doc (noise)
-                max_df=0.10,             # keep industry terms: "hotel","clinic","motors","road"
-                                         # (was 0.01 — incorrectly pruned many useful terms)
-            )
-            try:
-                mat = vec.fit_transform(corpus)
-            except ValueError:
-                # Empty corpus
-                continue
-            mat_norm = normalize(mat, norm="l2", copy=False)
-            self._vectorisers[country] = vec
-            self._matrices[country] = mat_norm
-            self._id_lists[country] = ids
+
+            n_sub = len(sub)
+            n_shards = max(1, (n_sub + self.SHARD_SIZE - 1) // self.SHARD_SIZE)
             log.info(
-                f"  TF-IDF [{country}]: {len(ids):,} docs,"
-                f" vocab={mat.shape[1]:,}, analyzer={self.analyzer!r}"
+                f"  TF-IDF [{country}]: {n_sub:,} docs → {n_shards} shard(s)"
+                f" (SHARD_SIZE={self.SHARD_SIZE:,})"
             )
+
+            rows_all = sub.to_dicts()
+            for shard_idx in range(n_shards):
+                shard_key = country if n_shards == 1 else f"{country}__shard{shard_idx}"
+                s_start = shard_idx * self.SHARD_SIZE
+                s_end   = min(s_start + self.SHARD_SIZE, n_sub)
+                rows = rows_all[s_start:s_end]
+                corpus = [self._corpus_string(r) for r in rows]
+                ids    = [r["entity_id"] for r in rows]
+
+                vec = TfidfVectorizer(
+                    ngram_range=self.ngram_range,
+                    max_features=self.max_features,
+                    sublinear_tf=True,
+                    analyzer=self.analyzer,
+                    min_df=2,
+                    max_df=0.10,
+                )
+                try:
+                    mat = vec.fit_transform(corpus)
+                except (ValueError, MemoryError) as exc:
+                    log.warning(
+                        f"  TF-IDF [{shard_key}] shard {shard_idx} FAILED ({exc}) — skipping"
+                    )
+                    continue
+
+                mat_norm = normalize(mat, norm="l2", copy=False)
+                self._vectorisers[shard_key] = vec
+                self._matrices[shard_key]    = mat_norm
+                self._id_lists[shard_key]    = ids
+                log.info(
+                    f"    shard {shard_idx}: {len(ids):,} docs,"
+                    f" vocab={mat.shape[1]:,}, analyzer={self.analyzer!r}"
+                )
+
+    def _shard_keys_for(self, country: str) -> list[str]:
+        """Return all shard keys that belong to a given country."""
+        if country in self._vectorisers:
+            return [country]
+        # Check for sharded keys: "India__shard0", "India__shard1", …
+        prefix = f"{country}__shard"
+        shards = sorted(k for k in self._vectorisers if k.startswith(prefix))
+        return shards
 
     def query(self, s1_row: dict) -> set[str]:
-        """Return top-K candidates for a single S1 entity."""
+        """Return top-K candidates for a single S1 entity (fans out across shards)."""
         country = s1_row.get("country") or "UNKNOWN"
-        vec = self._vectorisers.get(country)
-        if vec is None:
-            # Try all countries if country not in index (e.g. France in train gap)
+        shard_keys = self._shard_keys_for(country)
+        if not shard_keys:
+            # Fallback: query all shards across all countries
             results: set[str] = set()
-            for c in self._vectorisers:
-                results |= self._query_single(s1_row, c)
+            for sk in self._vectorisers:
+                results |= self._query_single(s1_row, sk)
             return results
-        return self._query_single(s1_row, country)
+        results: set[str] = set()
+        for sk in shard_keys:
+            results |= self._query_single(s1_row, sk)
+        return results
 
-    def _query_single(self, s1_row: dict, country: str) -> set[str]:
-        vec = self._vectorisers.get(country)
-        mat = self._matrices.get(country)
-        ids = self._id_lists.get(country)
+    def _query_single(self, s1_row: dict, shard_key: str) -> set[str]:
+        vec = self._vectorisers.get(shard_key)
+        mat = self._matrices.get(shard_key)
+        ids = self._id_lists.get(shard_key)
         if vec is None or mat is None:
             return set()
         q_text = self._corpus_string(s1_row)
@@ -284,6 +320,7 @@ class TFIDFRetriever:
     def query_batch(self, s1_rows: list[dict], n_workers: int = N_THREAD_WORKERS) -> list[set[str]]:
         """
         Multi-threaded batch TF-IDF query: Q @ mat_T across all CPU cores.
+        Handles sharded indices (e.g. India__shard0, India__shard1, …).
         """
         from collections import defaultdict
         from joblib import Parallel, delayed
@@ -292,41 +329,52 @@ class TFIDFRetriever:
         n_workers = safe_n_workers(n_workers)
 
         N = len(s1_rows)
-        results: list[set[str]] = [set()] * N
+        # Use a list of sets (not [set()]*N which shares references)
+        results: list[set[str]] = [set() for _ in range(N)]
 
-        # ── Group S1 indices by country ────────────────────────────────────
-        country_to_indices: dict[str, list[int]] = defaultdict(list)
-        fallback_indices: list[int] = []
+        # ── Build country → list[shard_key] map ───────────────────────────
+        # Maps each row index to all relevant shard keys
+        all_countries = set(
+            (row.get("country") or "UNKNOWN") for row in s1_rows
+        )
+        country_to_shards: dict[str, list[str]] = {}
+        for country in all_countries:
+            country_to_shards[country] = self._shard_keys_for(country) or list(self._vectorisers.keys())
+
+        # ── Group S1 indices by shard_key ──────────────────────────────────
+        shard_to_indices: dict[str, list[int]] = defaultdict(list)
         for i, row in enumerate(s1_rows):
             country = row.get("country") or "UNKNOWN"
-            if country in self._vectorisers:
-                country_to_indices[country].append(i)
-            else:
-                fallback_indices.append(i)
+            for sk in country_to_shards[country]:
+                shard_to_indices[sk].append(i)
 
-        # ── Per-country parallel sparse matmul: Q @ mat_T ──────────────────
-        for country, indices in country_to_indices.items():
-            vec = self._vectorisers[country]
-            mat = self._matrices[country]
-            ids = self._id_lists[country]
-            log.info(f"  [{country}] Preparing transposed corpus matrix …")
+        # ── Per-shard parallel sparse matmul: Q @ mat_T ────────────────────
+        for shard_key, indices in shard_to_indices.items():
+            vec = self._vectorisers.get(shard_key)
+            mat = self._matrices.get(shard_key)
+            ids = self._id_lists.get(shard_key)
+            if vec is None or mat is None:
+                continue
+
+            log.info(f"  [{shard_key}] Preparing transposed corpus matrix ({len(mat.data):,} nnz)…")
             mat_T = mat.T.tocsr()           # Transpose once!
 
             texts = [self._corpus_string(s1_rows[i]) for i in indices]
             n_batches = (len(texts) + BATCH_Q - 1) // BATCH_Q
-            log.info(f"  [{country}] {len(indices):,} queries → {n_batches:,} batches "
+            log.info(f"  [{shard_key}] {len(indices):,} queries → {n_batches:,} batches "
                      f"(BATCH_Q={BATCH_Q}, {n_workers} threads)")
 
             top_k = self.top_k
 
-            def _process_one_batch(b_idx: int) -> tuple[list[int], list[set[str]]]:
+            def _process_one_batch(b_idx: int, _indices=indices, _texts=texts,
+                                   _vec=vec, _mat_T=mat_T, _ids=ids) -> tuple[list[int], list[set[str]]]:
                 b_start = b_idx * BATCH_Q
-                b_texts = texts[b_start : b_start + BATCH_Q]
-                b_indices = indices[b_start : b_start + len(b_texts)]
+                b_texts = _texts[b_start : b_start + BATCH_Q]
+                b_indices = _indices[b_start : b_start + len(b_texts)]
                 try:
-                    Q = vec.transform(b_texts)
+                    Q = _vec.transform(b_texts)
                     Q = normalize(Q, norm="l2", copy=False)
-                    score_mat = Q @ mat_T
+                    score_mat = Q @ _mat_T
                 except Exception:
                     return b_indices, [set()] * len(b_indices)
 
@@ -341,16 +389,15 @@ class TFIDFRetriever:
                     cols = score_mat.indices[start:end]
                     n_nnz = len(vals)
                     if n_nnz <= top_k:
-                        batch_res.append({ids[cols[p]] for p in range(n_nnz) if vals[p] > 0.0})
+                        batch_res.append({_ids[cols[p]] for p in range(n_nnz) if vals[p] > 0.0})
                     else:
                         top_pos = np.argpartition(vals, -top_k)[-top_k:]
-                        batch_res.append({ids[cols[p]] for p in top_pos if vals[p] > 0.0})
+                        batch_res.append({_ids[cols[p]] for p in top_pos if vals[p] > 0.0})
                 return b_indices, batch_res
 
             # Run in parallel with progress bar
             with make_progress() as progress:
-                task = progress.add_task(f"  TF-IDF [{country}]", total=n_batches)
-                # Process in chunks of 50 batches for reactive progress reporting
+                task = progress.add_task(f"  TF-IDF [{shard_key}]", total=n_batches)
                 chunk_step = 25
                 for c_start in range(0, n_batches, chunk_step):
                     c_end = min(c_start + chunk_step, n_batches)
@@ -359,15 +406,8 @@ class TFIDFRetriever:
                     )
                     for b_indices, b_res in chunk_outputs:
                         for global_idx, res_set in zip(b_indices, b_res):
-                            results[global_idx] = res_set
+                            results[global_idx] |= res_set   # UNION across shards
                     progress.advance(task, advance=(c_end - c_start))
-
-        # ── Fallback: unknown-country rows query all buckets ───────────────
-        for i in fallback_indices:
-            combined: set[str] = set()
-            for c in self._vectorisers:
-                combined |= self._query_single(s1_rows[i], c)
-            results[i] = combined
 
         return results
 
@@ -654,7 +694,6 @@ def run_blocking(
                 "candidate_entity_ids": ",".join(sorted(cands)),
             })
             progress.advance(task)
-
 
     out = pl.DataFrame(results)
     n_with_cands = out.filter(pl.col("candidate_entity_ids") != "").height

@@ -154,6 +154,7 @@ def run_inference(
     min_save_threshold: float = 0.40,
     min_name_sim: float = 0.40,
     min_addr_sim: float = 0.25,
+    embed_scores_lookup: Optional[dict] = None,   # {(s1_id, cand_id): cosine_sim}
 ) -> dict[str, list[str]]:
     """
     Score candidate pairs in streaming entity batches using C++ rapidfuzz & LightGBM.
@@ -206,6 +207,17 @@ def run_inference(
 
             # Featurise batch
             chunk_dict = compute_chunk_dict(flat_df)
+
+            # Inject precomputed embedding cosine similarities if available
+            if embed_scores_lookup is not None:
+                s1_ids_arr  = chunk_dict["s1_id"]
+                cand_ids_arr = chunk_dict["cand_id"]
+                embed_sims = np.array(
+                    [embed_scores_lookup.get((sid, cid), 0.0)
+                     for sid, cid in zip(s1_ids_arr, cand_ids_arr)],
+                    dtype=np.float32,
+                )
+                chunk_dict["embed_cosine_sim"] = embed_sims
 
             # Build feature matrix in FEATURE_COLS order
             X = np.column_stack([chunk_dict[c] for c in FEATURE_COLS])
@@ -297,6 +309,9 @@ def main():
     parser.add_argument("--min-addr-sim", type=float, default=0.25,
                         help="Minimum addr_token_sort_ratio for Dual-Agreement Gate (default 0.25)")
     parser.add_argument("--no-country-filter", action="store_true")
+    parser.add_argument("--embed-scores-file", default=None,
+                        help="Optional parquet file with precomputed (s1_id, cand_id, embed_cosine_sim) columns."
+                             " When provided, fills the embed_cosine_sim feature for better accuracy.")
     args = parser.parse_args()
 
     proc_dir = Path(args.processed_dir)
@@ -335,6 +350,17 @@ def main():
             null_values=[""], infer_schema_length=100,
         )
 
+        # Load precomputed embedding scores if provided
+        embed_scores_lookup = None
+        if args.embed_scores_file and Path(args.embed_scores_file).exists():
+            log.info(f"Loading embedding scores from [highlight]{args.embed_scores_file}[/highlight] …")
+            embed_df = pl.read_parquet(args.embed_scores_file)
+            embed_scores_lookup = {
+                (row["s1_id"], row["cand_id"]): row["embed_cosine_sim"]
+                for row in embed_df.iter_rows(named=True)
+            }
+            log.info(f"  Loaded [highlight]{len(embed_scores_lookup):,}[/highlight] embedding similarity pairs")
+
         scores_path = str(out_dir / "scores_raw.parquet")
         predictions = run_inference(
             candidates_df, s1_df, s23_df, model,
@@ -346,6 +372,7 @@ def main():
             min_save_threshold=0.40,
             min_name_sim=args.min_name_sim,
             min_addr_sim=args.min_addr_sim,
+            embed_scores_lookup=embed_scores_lookup,
         )
 
         for s1_id in test_s1_ids:
