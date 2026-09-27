@@ -96,14 +96,15 @@ def main():
     log.info("STEP 2: Streaming Inference with LightGBM + Dual-Gate + Embeddings")
     log.info("=" * 60)
 
-    # Determine threshold
-    thresh = 0.40
     meta_path = OUT / "models" / meta_name
     if meta_path.exists():
         with open(meta_path) as f:
             m = json.load(f)
-            # If the trained model has a calibrated threshold, consider blending or using 0.40
-            log.info(f"Model meta: {m}")
+        thresh = float(m.get("threshold", 0.88))
+        log.info(f"Loaded calibrated threshold from {meta_name}: {thresh:.4f} (val F0.5: {m.get('val_macro_f05', 0):.4f})")
+    else:
+        thresh = 0.88
+        log.info(f"Using default high-precision threshold: {thresh:.4f}")
 
     run(
         [
